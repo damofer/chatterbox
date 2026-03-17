@@ -1160,169 +1160,21 @@ def toggle_backend(choice):
 
 # --- Gradio UI ---
 with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
-    gr.Markdown("# Chat de Voz — Streaming IA + Chatterbox TTS")
-    gr.Markdown(
-        "**Modo Conversación**: activa el micrófono continuo, habla libremente, "
-        "la IA detecta cuándo terminas y responde automáticamente.\n\n"
-        "También puedes escribir manualmente abajo."
-    )
+   
 
     # Conversation state (VAD buffer, flags, etc.)
     conv_state = gr.State(make_conv_state)
 
-    with gr.Row():
-        # Left column — settings
-        with gr.Column(scale=1):
-            backend = gr.Radio(
-                choices=["Gemini", "Ollama"],
-                value="Ollama",
-                label="Backend LLM",
-            )
-            api_key = gr.Textbox(
-                label="Gemini API Key",
-                type="password",
-                placeholder="AIza...",
-                value=os.environ.get("GEMINI_API_KEY", ""),
-                visible=False,
-            )
-            gemini_model = gr.Dropdown(
-                choices=[
-                    "gemini-2.0-flash",
-                    "gemini-2.0-flash-lite",
-                    "gemini-1.5-flash",
-                    "gemini-1.5-pro",
-                ],
-                value="gemini-2.0-flash-lite",
-                label="Modelo Gemini",
-                visible=False,
-            )
-            ollama_available = get_ollama_models()
-            ollama_model = gr.Dropdown(
-                choices=ollama_available,
-                value=ollama_available[0] if ollama_available else None,
-                label="Modelo Ollama",
-                visible=True,
-            )
-            refresh_btn = gr.Button("Actualizar modelos Ollama", visible=True, size="sm")
-
-            gr.Markdown("---")
-            gr.Markdown(
-                "#### Voz de referencia\n"
-                "Prioridad: **1)** audio subido aquí → **2)** `voices/default.wav` → "
-                "**3)** voz descargada automáticamente.\n\n"
-                "Para usar tu propia voz LATAM por defecto, coloca un `.wav` de ~10s "
-                "en la carpeta `voices/default.wav` del proyecto."
-            )
-            ref_audio = gr.Audio(
-                sources=["upload", "microphone"],
-                type="filepath",
-                label="Voz de referencia (WAV/FLAC, ~10s) — opcional para español",
-            )
-            exaggeration = gr.Slider(0.25, 2, step=0.05, value=0.5, label="Exageración")
-            cfg_weight = gr.Slider(0.0, 1.0, step=0.05, value=0.5, label="CFG / Ritmo")
-            speed_factor = gr.Slider(0.5, 2.0, step=0.05, value=1.0, label="Velocidad de voz")
-            cfm_steps = gr.Slider(
-                2, 10, step=1, value=4,
-                label="Pasos CFM (calidad vs velocidad)",
-                info="Menos pasos = más rápido. 4 = buen balance, 10 = máxima calidad.",
-            )
-
-            gr.Markdown("---")
-            gr.Markdown("#### Modelo y Idioma TTS")
-            tts_model_type = gr.Radio(
-                choices=[
-                    ("Multilingüe (español nativo + 22 idiomas)", "multilingual"),
-                    ("Inglés (original, solo EN)", "english"),
-                ],
-                value="multilingual",
-                label="Modelo TTS",
-            )
-            tts_language = gr.Dropdown(
-                choices=[
-                    ("Español (Latinoamérica)", "es"),
-                    ("English", "en"),
-                    ("Français", "fr"),
-                    ("Deutsch", "de"),
-                    ("Italiano", "it"),
-                    ("Português", "pt"),
-                    ("中文", "zh"),
-                    ("日本語", "ja"),
-                    ("한국어", "ko"),
-                    ("Русский", "ru"),
-                    ("العربية", "ar"),
-                    ("Hindi", "hi"),
-                    ("Türkçe", "tr"),
-                    ("Nederlands", "nl"),
-                    ("Polski", "pl"),
-                    ("Svenska", "sv"),
-                    ("Suomi", "fi"),
-                    ("Norsk", "no"),
-                    ("Dansk", "da"),
-                    ("Ελληνικά", "el"),
-                    ("עברית", "he"),
-                    ("Melayu", "ms"),
-                    ("Kiswahili", "sw"),
-                ],
-                value="es",
-                label="Idioma TTS (voz de salida)",
-                info="Idioma en el que el modelo genera la voz. Usa Multilingüe para idiomas != inglés.",
-            )
-
-            gr.Markdown("---")
-            stt_language = gr.Dropdown(
-                choices=[
-                    ("Español (Latinoamérica)", "es"),
-                    ("English", "en"),
-                    ("Français", "fr"),
-                    ("Deutsch", "de"),
-                    ("Italiano", "it"),
-                    ("Português", "pt"),
-                    ("Auto-detectar", ""),
-                ],
-                value="es",
-                label="Idioma de voz (STT — reconocimiento)",
-            )
-
-            gr.Markdown("---")
-            gr.Markdown("#### 📚 Base de Conocimiento (RAG)")
-            gr.Markdown(
-                "Sube archivos **PDF** o **TXT** para que el asistente "
-                "use esa información al responder."
-            )
-            rag_upload = gr.File(
-                label="Subir documentos (PDF / TXT)",
-                file_types=[".pdf", ".txt"],
-                file_count="multiple",
-                type="filepath",
-            )
-            rag_upload_result = gr.Textbox(label="Resultado", interactive=False)
-            rag_status = gr.Textbox(
-                label="Documentos cargados",
-                value=_count_knowledge_files(),
-                interactive=False,
-            )
-            with gr.Row():
-                rag_doc_select = gr.Dropdown(
-                    choices=[os.path.basename(f) for f in _list_knowledge_files()],
-                    label="Seleccionar documento",
-                    allow_custom_value=False,
-                    scale=3,
-                )
-                rag_delete_btn = gr.Button("🗑️ Eliminar", size="sm", variant="stop", scale=1)
-            with gr.Row():
-                rag_index_btn = gr.Button("📚 Indexar documentos", variant="primary", size="sm")
-            rag_result = gr.Textbox(label="Resultado de indexación", interactive=False)
-
-        # Right column — chat
-        with gr.Column(scale=2):
-            chatbot = gr.Chatbot(label="Conversación", height=400, type="messages")
+    with gr.Tabs():
+        # ── Tab 1: Chat ──────────────────────────────────────
+        with gr.Tab("💬 Chat"):
+            chatbot = gr.Chatbot(label="Conversación", height=450, type="messages")
             audio_output = gr.Audio(
                 label="Respuesta de voz",
                 streaming=True,
                 autoplay=True,
             )
 
-            # --- Conversation mode: record and auto-process ---
             gr.Markdown("### 🎙️ Modo Conversación (grabar y procesar)")
             gr.Markdown(
                 "Pulsa para grabar, vuelve a pulsar para parar. "
@@ -1344,6 +1196,151 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
                 )
                 send_btn = gr.Button("Enviar", variant="primary", scale=1)
             clear_btn = gr.Button("Limpiar conversación")
+
+        # ── Tab 2: Configuración ─────────────────────────────
+        with gr.Tab("⚙️ Configuración"):
+            with gr.Group():
+                gr.Markdown("#### Backend LLM")
+                backend = gr.Radio(
+                    choices=["Gemini", "Ollama"],
+                    value="Ollama",
+                    label="Backend LLM",
+                )
+                api_key = gr.Textbox(
+                    label="Gemini API Key",
+                    type="password",
+                    placeholder="AIza...",
+                    value=os.environ.get("GEMINI_API_KEY", ""),
+                    visible=False,
+                )
+                gemini_model = gr.Dropdown(
+                    choices=[
+                        "gemini-2.0-flash",
+                        "gemini-2.0-flash-lite",
+                        "gemini-1.5-flash",
+                        "gemini-1.5-pro",
+                    ],
+                    value="gemini-2.0-flash-lite",
+                    label="Modelo Gemini",
+                    visible=False,
+                )
+                ollama_available = get_ollama_models()
+                ollama_model = gr.Dropdown(
+                    choices=ollama_available,
+                    value=ollama_available[0] if ollama_available else None,
+                    label="Modelo Ollama",
+                    visible=True,
+                )
+                refresh_btn = gr.Button("Actualizar modelos Ollama", visible=True, size="sm")
+
+            with gr.Group():
+                gr.Markdown(
+                    "#### Voz de referencia\n"
+                    "Prioridad: **1)** audio subido aquí → **2)** `voices/default.wav` → "
+                    "**3)** voz descargada automáticamente.\n\n"
+                    "Para usar tu propia voz LATAM por defecto, coloca un `.wav` de ~10s "
+                    "en la carpeta `voices/default.wav` del proyecto."
+                )
+                ref_audio = gr.Audio(
+                    sources=["upload", "microphone"],
+                    type="filepath",
+                    label="Voz de referencia (WAV/FLAC, ~10s) — opcional para español",
+                )
+                exaggeration = gr.Slider(0.25, 2, step=0.05, value=0.5, label="Exageración")
+                cfg_weight = gr.Slider(0.0, 1.0, step=0.05, value=0.5, label="CFG / Ritmo")
+                speed_factor = gr.Slider(0.5, 2.0, step=0.05, value=1.0, label="Velocidad de voz")
+                cfm_steps = gr.Slider(
+                    2, 10, step=1, value=4,
+                    label="Pasos CFM (calidad vs velocidad)",
+                    info="Menos pasos = más rápido. 4 = buen balance, 10 = máxima calidad.",
+                )
+
+            with gr.Group():
+                gr.Markdown("#### Modelo y Idioma TTS")
+                tts_model_type = gr.Radio(
+                    choices=[
+                        ("Multilingüe (español nativo + 22 idiomas)", "multilingual"),
+                        ("Inglés (original, solo EN)", "english"),
+                    ],
+                    value="multilingual",
+                    label="Modelo TTS",
+                )
+                tts_language = gr.Dropdown(
+                    choices=[
+                        ("Español (Latinoamérica)", "es"),
+                        ("English", "en"),
+                        ("Français", "fr"),
+                        ("Deutsch", "de"),
+                        ("Italiano", "it"),
+                        ("Português", "pt"),
+                        ("中文", "zh"),
+                        ("日本語", "ja"),
+                        ("한국어", "ko"),
+                        ("Русский", "ru"),
+                        ("العربية", "ar"),
+                        ("Hindi", "hi"),
+                        ("Türkçe", "tr"),
+                        ("Nederlands", "nl"),
+                        ("Polski", "pl"),
+                        ("Svenska", "sv"),
+                        ("Suomi", "fi"),
+                        ("Norsk", "no"),
+                        ("Dansk", "da"),
+                        ("Ελληνικά", "el"),
+                        ("עברית", "he"),
+                        ("Melayu", "ms"),
+                        ("Kiswahili", "sw"),
+                    ],
+                    value="es",
+                    label="Idioma TTS (voz de salida)",
+                    info="Idioma en el que el modelo genera la voz. Usa Multilingüe para idiomas != inglés.",
+                )
+
+            with gr.Group():
+                gr.Markdown("#### Idioma de reconocimiento de voz")
+                stt_language = gr.Dropdown(
+                    choices=[
+                        ("Español (Latinoamérica)", "es"),
+                        ("English", "en"),
+                        ("Français", "fr"),
+                        ("Deutsch", "de"),
+                        ("Italiano", "it"),
+                        ("Português", "pt"),
+                        ("Auto-detectar", ""),
+                    ],
+                    value="es",
+                    label="Idioma de voz (STT — reconocimiento)",
+                )
+
+            with gr.Group():
+                gr.Markdown("#### 📚 Base de Conocimiento (RAG)")
+                gr.Markdown(
+                    "Sube archivos **PDF** o **TXT** para que el asistente "
+                    "use esa información al responder."
+                )
+                rag_upload = gr.File(
+                    label="Subir documentos (PDF / TXT)",
+                    file_types=[".pdf", ".txt"],
+                    file_count="multiple",
+                    type="filepath",
+                )
+                rag_upload_result = gr.Textbox(label="Resultado", interactive=False)
+                rag_status = gr.Textbox(
+                    label="Documentos cargados",
+                    value=_count_knowledge_files(),
+                    interactive=False,
+                )
+                with gr.Row():
+                    rag_doc_select = gr.Dropdown(
+                        choices=[os.path.basename(f) for f in _list_knowledge_files()],
+                        label="Seleccionar documento",
+                        allow_custom_value=False,
+                        scale=3,
+                    )
+                    rag_delete_btn = gr.Button("🗑️ Eliminar", size="sm", variant="stop", scale=1)
+                with gr.Row():
+                    rag_index_btn = gr.Button("📚 Indexar documentos", variant="primary", size="sm")
+                rag_result = gr.Textbox(label="Resultado de indexación", interactive=False)
 
     # --- Event wiring ---
 
