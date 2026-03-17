@@ -12,6 +12,7 @@ Features:
 """
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -20,6 +21,18 @@ import tempfile
 import threading
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+
+# Suppress benign uvicorn RuntimeError when Gradio cancels streaming responses
+class _UvicornCancelFilter(logging.Filter):
+    def filter(self, record):
+        if record.exc_info and record.exc_info[1]:
+            msg = str(record.exc_info[1])
+            if "Response content shorter than Content-Length" in msg:
+                return False
+        return True
+
+logging.getLogger("uvicorn.error").addFilter(_UvicornCancelFilter())
+logging.getLogger("uvicorn").addFilter(_UvicornCancelFilter())
 
 # Ensure ffmpeg is discoverable (PATH may not be refreshed in spawned terminals)
 if os.name == "nt" and not shutil.which("ffmpeg"):
@@ -690,6 +703,22 @@ def _tts_generate(model, sentence, model_type, tts_language, exaggeration, cfg_w
 _tts_lock = threading.Lock()
 TTS_WORKERS = 3
 
+# --- Generation cancellation: new messages always take priority ---
+_generation_id_lock = threading.Lock()
+_generation_id = 0  # monotonically increasing; checked by generators
+
+def _new_generation_id():
+    """Bump and return a new generation ID, effectively cancelling previous ones."""
+    global _generation_id
+    with _generation_id_lock:
+        _generation_id += 1
+        return _generation_id
+
+def _is_cancelled(gen_id):
+    """Return True if a newer generation has started."""
+    with _generation_id_lock:
+        return gen_id != _generation_id
+
 
 def _prepare_tts_input(model, sentence, model_type, tts_language, exaggeration, cfg_weight):
     """CPU work: normalize text + tokenize. Returns args needed for GPU inference."""
@@ -766,20 +795,62 @@ def _gpu_generate(model, prepared, exaggeration, cfg_weight, n_cfm_steps=10):
         )
 
 
-def _tts_worker(model, sentence, model_type, tts_language, exaggeration, cfg_weight, speed_factor, sr, n_cfm_steps=10):
+class _CancelledError(Exception):
+    """Raised when a TTS worker detects its generation was cancelled."""
+    pass
+
+
+def _tts_worker(model, sentence, model_type, tts_language, exaggeration, cfg_weight, speed_factor, sr, n_cfm_steps=10, gen_id=None):
     """Thread worker: prepare (CPU, parallel) → generate (GPU, locked) → post-process (CPU, parallel)."""
+    # Check cancellation before doing any work
+    if gen_id is not None and _is_cancelled(gen_id):
+        raise _CancelledError()
+
     # Phase 1: CPU — text normalization + tokenization (runs in parallel)
     prepared = _prepare_tts_input(model, sentence, model_type, tts_language, exaggeration, cfg_weight)
 
+    # Check cancellation before expensive GPU inference
+    if gen_id is not None and _is_cancelled(gen_id):
+        raise _CancelledError()
+
     # Phase 2: GPU — inference (serialized)
-    with _tts_lock:
+    # Use polling loop instead of blocking lock so cancelled workers bail out
+    # instead of holding up the queue for the new generation's workers.
+    while True:
+        if gen_id is not None and _is_cancelled(gen_id):
+            raise _CancelledError()
+        if _tts_lock.acquire(timeout=0.2):
+            break
+    try:
+        # Check once more after acquiring lock (another gen may have started while waiting)
+        if gen_id is not None and _is_cancelled(gen_id):
+            raise _CancelledError()
         wav = _gpu_generate(model, prepared, exaggeration, cfg_weight, n_cfm_steps)
+    finally:
+        _tts_lock.release()
 
     # Phase 3: CPU — numpy conversion + speed adjustment (runs in parallel)
     wav_np = wav.squeeze(0).numpy()
     wav_int16 = (np.clip(wav_np, -1.0, 1.0) * 32767).astype(np.int16)
     wav_int16, out_sr = _apply_speed(wav_int16, sr, speed_factor)
     return out_sr, wav_int16
+
+
+def _wait_future_or_cancel(fut, gen_id):
+    """Wait for a TTS future, but bail out quickly if generation was cancelled.
+
+    Uses polling with short timeouts so the calling generator never blocks
+    for longer than 0.3s.
+    """
+    from concurrent.futures import TimeoutError as FutTimeout
+    while True:
+        if _is_cancelled(gen_id):
+            fut.cancel()
+            raise _CancelledError()
+        try:
+            return fut.result(timeout=0.3)
+        except FutTimeout:
+            continue
 
 
 def _extract_complete_sentences(pending):
@@ -1022,6 +1093,9 @@ def auto_conversation(
     if audio_path is None:
         return chat_history, None, None
 
+    # Cancel any previous generation — new message always has priority
+    gen_id = _new_generation_id()
+
     # Transcribe
     user_message = transcribe(audio_path, language=stt_language)
     if not user_message or len(user_message.strip()) < 2:
@@ -1055,6 +1129,9 @@ def auto_conversation(
 
     try:
         for text_chunk in llm_stream:
+            if _is_cancelled(gen_id):
+                print(f"  ⏹️ LLM cancelado (nueva solicitud recibida)")
+                break
             full_reply += text_chunk
             pending_text += text_chunk
             streaming_h = chat_history + [
@@ -1072,16 +1149,18 @@ def auto_conversation(
                         _tts_worker, model, sent,
                         tts_model_type, tts_language,
                         exaggeration, cfg_weight, speed_factor, model.sr, int(cfm_steps),
+                        gen_id,
                     )
                     tts_futures.append(fut)
 
         # Submit remaining text
-        if pending_text.strip():
+        if pending_text.strip() and not _is_cancelled(gen_id):
             print(f"  🔊 TTS submit (final): {pending_text[:60]}...")
             fut = pool.submit(
                 _tts_worker, model, pending_text.strip(),
                 tts_model_type, tts_language,
                 exaggeration, cfg_weight, speed_factor, model.sr, int(cfm_steps),
+                gen_id,
             )
             tts_futures.append(fut)
 
@@ -1093,10 +1172,42 @@ def auto_conversation(
         ]
 
         # Yield audio in order as futures complete
+        from concurrent.futures import TimeoutError as _FutTimeout
         for i, fut in enumerate(tts_futures):
-            out_sr, wav_int16 = fut.result()
-            print(f"  ✅ TTS [{i+1}/{len(tts_futures)}] listo")
-            yield final_h, (out_sr, wav_int16), None
+            if _is_cancelled(gen_id):
+                print(f"  ⏹️ Generación cancelada (nueva solicitud recibida)")
+                for remaining in tts_futures[i:]:
+                    remaining.cancel()
+                break
+            # Poll with yields so Gradio can cancel the generator between iterations
+            result = None
+            while result is None:
+                if _is_cancelled(gen_id):
+                    fut.cancel()
+                    print(f"  ⏹️ TTS cancelado [{i+1}/{len(tts_futures)}]")
+                    for remaining in tts_futures[i:]:
+                        remaining.cancel()
+                    break
+                try:
+                    result = fut.result(timeout=0.3)
+                except _FutTimeout:
+                    # Yield to let Gradio process cancellation
+                    yield final_h, None, None
+                    continue
+                except _CancelledError:
+                    print(f"  ⏹️ TTS worker cancelado [{i+1}/{len(tts_futures)}]")
+                    for remaining in tts_futures[i+1:]:
+                        remaining.cancel()
+                    break
+            else:
+                out_sr, wav_int16 = result
+                print(f"  ✅ TTS [{i+1}/{len(tts_futures)}] listo")
+                yield final_h, (out_sr, wav_int16), None
+                continue
+            break  # cancelled — exit outer loop
+    except (RuntimeError, GeneratorExit):
+        # Gradio cancelled the generator (e.g. new recording started)
+        print(f"  ⏹️ Generador interrumpido por cancelación")
     finally:
         pool.shutdown(wait=False)
 
@@ -1123,6 +1234,9 @@ def chat_and_speak(
     if not user_message:
         raise gr.Error("Escribe un mensaje.")
 
+    # Cancel any previous generation — new message always has priority
+    gen_id = _new_generation_id()
+
     model = load_tts(tts_model_type)
 
     resolved_ref = _resolve_ref_audio(ref_audio, tts_language)
@@ -1148,6 +1262,9 @@ def chat_and_speak(
 
     try:
         for text_chunk in llm_stream:
+            if _is_cancelled(gen_id):
+                print(f"  ⏹️ LLM cancelado (nueva solicitud recibida)")
+                break
             full_reply += text_chunk
             pending_text += text_chunk
             streaming_history = chat_history + [
@@ -1164,15 +1281,17 @@ def chat_and_speak(
                         _tts_worker, model, sent,
                         tts_model_type, tts_language,
                         exaggeration, cfg_weight, speed_factor, model.sr, int(cfm_steps),
+                        gen_id,
                     )
                     tts_futures.append(fut)
 
         # Submit remaining text
-        if pending_text.strip():
+        if pending_text.strip() and not _is_cancelled(gen_id):
             fut = pool.submit(
                 _tts_worker, model, pending_text.strip(),
                 tts_model_type, tts_language,
                 exaggeration, cfg_weight, speed_factor, model.sr, int(cfm_steps),
+                gen_id,
             )
             tts_futures.append(fut)
 
@@ -1182,9 +1301,41 @@ def chat_and_speak(
         ]
 
         # Yield audio in order as futures complete
-        for fut in tts_futures:
-            out_sr, wav_int16 = fut.result()
-            yield final_history, (out_sr, wav_int16), ""
+        from concurrent.futures import TimeoutError as _FutTimeout
+        for i, fut in enumerate(tts_futures):
+            if _is_cancelled(gen_id):
+                print(f"  ⏹️ Generación cancelada (nueva solicitud recibida)")
+                for remaining in tts_futures[i:]:
+                    remaining.cancel()
+                break
+            # Poll with yields so Gradio can cancel the generator between iterations
+            result = None
+            while result is None:
+                if _is_cancelled(gen_id):
+                    fut.cancel()
+                    print(f"  ⏹️ TTS cancelado [{i+1}/{len(tts_futures)}]")
+                    for remaining in tts_futures[i:]:
+                        remaining.cancel()
+                    break
+                try:
+                    result = fut.result(timeout=0.3)
+                except _FutTimeout:
+                    # Yield to let Gradio process cancellation
+                    yield final_history, None, ""
+                    continue
+                except _CancelledError:
+                    print(f"  ⏹️ TTS worker cancelado [{i+1}/{len(tts_futures)}]")
+                    for remaining in tts_futures[i+1:]:
+                        remaining.cancel()
+                    break
+            else:
+                out_sr, wav_int16 = result
+                yield final_history, (out_sr, wav_int16), ""
+                continue
+            break  # cancelled — exit outer loop
+    except (RuntimeError, GeneratorExit):
+        # Gradio cancelled the generator (e.g. new message sent)
+        print(f"  ⏹️ Generador interrumpido por cancelación")
     finally:
         pool.shutdown(wait=False)
 
@@ -1499,10 +1650,21 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
         tts_model_type, tts_language, speed_factor, cfm_steps,
         system_prompt_input,
     ]
-    conversation_mic.stop_recording(
+    conv_event = conversation_mic.stop_recording(
         fn=auto_conversation,
         inputs=conv_inputs,
         outputs=[chatbot, audio_output, conversation_mic],
+    )
+
+    # When user starts a NEW recording, cancel any in-progress generation
+    # so the new query always takes priority over old audio playback.
+    def _cancel_on_new_recording():
+        _new_generation_id()
+        return None  # clear audio output to stop playback
+    conversation_mic.start_recording(
+        fn=_cancel_on_new_recording,
+        outputs=[audio_output],
+        cancels=[conv_event],
     )
 
     # Manual mode
@@ -1514,11 +1676,19 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
     ]
     manual_outputs = [chatbot, audio_output, user_input]
 
-    send_btn.click(fn=chat_and_speak, inputs=manual_inputs, outputs=manual_outputs)
-    user_input.submit(fn=chat_and_speak, inputs=manual_inputs, outputs=manual_outputs)
+    # Each new message cancels any in-progress audio generation
+    send_event = send_btn.click(
+        fn=chat_and_speak, inputs=manual_inputs, outputs=manual_outputs,
+        cancels=[conv_event],
+    )
+    submit_event = user_input.submit(
+        fn=chat_and_speak, inputs=manual_inputs, outputs=manual_outputs,
+        cancels=[conv_event, send_event],
+    )
     clear_btn.click(
         lambda: ([], None, ""),
         outputs=[chatbot, audio_output, user_input],
+        cancels=[conv_event, send_event, submit_event],
     )
 
     # --- Restore saved config on every page load/refresh ---

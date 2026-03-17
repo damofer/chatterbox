@@ -180,5 +180,7 @@ If you find this model useful, please consider citing.
 ## Disclaimer
 Don't use this model to do bad things. Prompts are sourced from freely available data on the internet.
 
-
+## dev run
+.venv\Scripts\python.exe voice_chat_app.py      
+## packaging
 powershell -ExecutionPolicy Bypass -File installer\prepare_build.ps1
