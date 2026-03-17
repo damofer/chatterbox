@@ -66,8 +66,9 @@ class T3CondEnc(nn.Module):
         assert (cond.cond_prompt_speech_tokens is None) == (cond.cond_prompt_speech_emb is None), \
             "no embeddings for cond_prompt_speech_tokens"
 
-        # Speaker embedding projection
-        cond_spkr = self.spkr_enc(cond.speaker_emb.view(-1, self.hp.speaker_embed_size))[:, None]  # (B, 1, dim)
+        # Speaker embedding projection (cast to model dtype in case speaker_encoder produced fp32)
+        _dtype = self.spkr_enc.weight.dtype
+        cond_spkr = self.spkr_enc(cond.speaker_emb.view(-1, self.hp.speaker_embed_size).to(_dtype))[:, None]  # (B, 1, dim)
         empty = torch.zeros_like(cond_spkr[:, :0])  # (B, 0, dim)
 
         # TODO CLAP
@@ -85,7 +86,7 @@ class T3CondEnc(nn.Module):
         cond_emotion_adv = empty  # (B, 0, dim)
         if self.hp.emotion_adv:
             assert cond.emotion_adv is not None
-            cond_emotion_adv = self.emotion_adv_fc(cond.emotion_adv.view(-1, 1, 1))
+            cond_emotion_adv = self.emotion_adv_fc(cond.emotion_adv.view(-1, 1, 1).to(_dtype))
 
         # Concat and return
         cond_embeds = torch.cat((

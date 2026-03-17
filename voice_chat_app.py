@@ -16,7 +16,9 @@ import re
 import shutil
 import time
 import tempfile
+import threading
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 # Ensure ffmpeg is discoverable (PATH may not be refreshed in spawned terminals)
 if os.name == "nt" and not shutil.which("ffmpeg"):
@@ -44,7 +46,15 @@ from chatterbox.mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# --- Default reference audio for Spanish LATAM ---
+# --- CUDA performance optimizations ---
+if DEVICE == "cuda":
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+# --- Default reference audio ---
+_VOICES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voices")
+_LOCAL_DEFAULT_REF = os.path.join(_VOICES_DIR, "default.wav")
 _DEFAULT_ES_REF_URL = "https://storage.googleapis.com/chatterbox-demo-samples/mtl_prompts/es_f1.flac"
 _DEFAULT_ES_REF_PATH = os.path.join(tempfile.gettempdir(), "chatterbox_es_latam_ref.flac")
 
@@ -60,9 +70,12 @@ def _ensure_default_es_ref() -> str:
 
 
 def _resolve_ref_audio(ref_audio, tts_language):
-    """Return the ref audio path, falling back to default Spanish voice if needed."""
+    """Return the ref audio path: user upload > voices/default.wav > download."""
     if ref_audio:
         return ref_audio
+    if os.path.exists(_LOCAL_DEFAULT_REF):
+        print(f"Usando voz de referencia local: {_LOCAL_DEFAULT_REF}")
+        return _LOCAL_DEFAULT_REF
     if tts_language == "es":
         return _ensure_default_es_ref()
     return None
@@ -84,6 +97,28 @@ def load_tts(model_type="multilingual"):
             tts_model = ChatterboxTTS.from_pretrained(DEVICE)
         _current_model_type = model_type
         _cached_ref_key = None  # reset cache when model changes
+
+        # --- Optimization: convert to bfloat16 on CUDA ---
+        if DEVICE == "cuda" and torch.cuda.is_bf16_supported():
+            print("Aplicando optimización bfloat16...")
+            tts_model.t3.to(dtype=torch.bfloat16)
+            # S3Gen: only convert flow model + HiFiGAN vocoder
+            # Keep speaker_encoder and tokenizer in fp32 (FFT doesn't support bf16)
+            tts_model.s3gen.flow.to(dtype=torch.bfloat16)
+            tts_model.s3gen.mel2wav.to(dtype=torch.bfloat16)
+            print("✅ bfloat16 activado para T3 + S3Gen (flow + vocoder)")
+
+        # --- Optimization: torch.compile key modules ---
+        # Skipped: mode="reduce-overhead" requires Triton which is not available on Windows.
+        # torch.compile with default backend (inductor) also needs Triton on CUDA.
+        # If Triton becomes available, uncomment below:
+        # try:
+        #     tts_model.t3.tfmr = torch.compile(tts_model.t3.tfmr, mode="reduce-overhead")
+        #     tts_model.s3gen.mel2wav = torch.compile(tts_model.s3gen.mel2wav, mode="reduce-overhead")
+        #     print("✅ torch.compile activado")
+        # except Exception as e:
+        #     print(f"⚠️ torch.compile no disponible: {e}")
+
     return tts_model
 
 
@@ -287,7 +322,7 @@ def transcribe(audio_path, language="es"):
             device=DEVICE,
         )
     generate_kwargs = {"language": language} if language else {}
-    result = _whisper_pipe(audio_path, generate_kwargs=generate_kwargs)
+    result = _whisper_pipe(audio_path, generate_kwargs=generate_kwargs, return_timestamps=True)
     return result["text"].strip()
 
 
@@ -381,6 +416,111 @@ def _tts_generate(model, sentence, model_type, tts_language, exaggeration, cfg_w
             exaggeration=exaggeration,
             cfg_weight=cfg_weight,
         )
+
+
+# --- Pipelined TTS: overlap T3 (token gen) of sentence N+1 with S3Gen (vocoder) of sentence N ---
+_tts_lock = threading.Lock()
+TTS_WORKERS = 3
+
+
+def _prepare_tts_input(model, sentence, model_type, tts_language, exaggeration, cfg_weight):
+    """CPU work: normalize text + tokenize. Returns args needed for GPU inference."""
+    import torch.nn.functional as F
+
+    if tts_language == "es":
+        sentence = normalize_spanish_text(sentence)
+
+    if model_type == "multilingual":
+        # Replicate what model.generate() does before GPU inference
+        from chatterbox.mtl_tts import punc_norm
+        text = punc_norm(sentence)
+        text_tokens = model.tokenizer.text_to_tokens(
+            text, language_id=tts_language.lower() if tts_language else None
+        ).to(model.device)
+        text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
+        sot = model.t3.hp.start_text_token
+        eot = model.t3.hp.stop_text_token
+        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+        return {"text_tokens": text_tokens, "model_type": model_type}
+    else:
+        # English model — just pass through; can't easily split its pipeline
+        return {"sentence": sentence, "model_type": model_type}
+
+
+def _gpu_generate(model, prepared, exaggeration, cfg_weight, n_cfm_steps=10):
+    """GPU work: run T3 inference + S3Gen vocoder. Must hold _tts_lock."""
+    from chatterbox.models.s3tokenizer import drop_invalid_tokens
+
+    if prepared["model_type"] == "multilingual":
+        text_tokens = prepared["text_tokens"]
+
+        # Update exaggeration if needed
+        if float(exaggeration) != float(model.conds.t3.emotion_adv[0, 0, 0].item()):
+            from chatterbox.models.t3.modules.cond_enc import T3Cond
+            _cond = model.conds.t3
+            model.conds.t3 = T3Cond(
+                speaker_emb=_cond.speaker_emb,
+                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1),
+            ).to(device=model.device)
+
+        with torch.inference_mode(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            speech_tokens = model.t3.inference(
+                t3_cond=model.conds.t3,
+                text_tokens=text_tokens,
+                max_new_tokens=1000,
+                temperature=0.8,
+                cfg_weight=cfg_weight,
+                repetition_penalty=2.0,
+                min_p=0.05,
+                top_p=1.0,
+            )
+            speech_tokens = speech_tokens[0]
+            speech_tokens = drop_invalid_tokens(speech_tokens)
+            speech_tokens = speech_tokens.to(model.device)
+
+            wav, _ = model.s3gen.inference(
+                speech_tokens=speech_tokens,
+                ref_dict=model.conds.gen,
+                n_cfm_timesteps=n_cfm_steps,
+            )
+            wav = wav.squeeze(0).detach().cpu().numpy()
+            watermarked_wav = model.watermarker.apply_watermark(wav, sample_rate=model.sr)
+        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+    else:
+        # English model — use standard generate
+        return model.generate(
+            prepared["sentence"],
+            audio_prompt_path=None,
+            exaggeration=exaggeration,
+            cfg_weight=cfg_weight,
+        )
+
+
+def _tts_worker(model, sentence, model_type, tts_language, exaggeration, cfg_weight, speed_factor, sr, n_cfm_steps=10):
+    """Thread worker: prepare (CPU, parallel) → generate (GPU, locked) → post-process (CPU, parallel)."""
+    # Phase 1: CPU — text normalization + tokenization (runs in parallel)
+    prepared = _prepare_tts_input(model, sentence, model_type, tts_language, exaggeration, cfg_weight)
+
+    # Phase 2: GPU — inference (serialized)
+    with _tts_lock:
+        wav = _gpu_generate(model, prepared, exaggeration, cfg_weight, n_cfm_steps)
+
+    # Phase 3: CPU — numpy conversion + speed adjustment (runs in parallel)
+    wav_np = wav.squeeze(0).numpy()
+    wav_int16 = (np.clip(wav_np, -1.0, 1.0) * 32767).astype(np.int16)
+    wav_int16, out_sr = _apply_speed(wav_int16, sr, speed_factor)
+    return out_sr, wav_int16
+
+
+def _extract_complete_sentences(pending):
+    """Split pending text into (complete_sentences_list, remaining_text)."""
+    parts = re.split(r'(?<=[.!?])\s+', pending.strip())
+    if len(parts) <= 1:
+        return [], pending
+    # All but last are complete (they had punctuation + space after them)
+    return parts[:-1], parts[-1]
 
 
 def _apply_speed(wav_np, sr, speed_factor):
@@ -607,6 +747,7 @@ def auto_conversation(
     tts_model_type,
     tts_language,
     speed_factor,
+    cfm_steps,
 ):
     """When user stops recording, auto-transcribe → LLM → TTS."""
     if audio_path is None:
@@ -637,32 +778,58 @@ def auto_conversation(
     else:
         llm_stream = stream_ollama(ollama_model, chat_history, user_message)
 
-    # Phase 1: Stream LLM text
+    # Pipeline: LLM streaming + parallel TTS generation
     full_reply = ""
-    for text_chunk in llm_stream:
-        full_reply += text_chunk
-        streaming_h = chat_history + [
+    pending_text = ""
+    tts_futures = []
+    pool = ThreadPoolExecutor(max_workers=TTS_WORKERS)
+
+    try:
+        for text_chunk in llm_stream:
+            full_reply += text_chunk
+            pending_text += text_chunk
+            streaming_h = chat_history + [
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": full_reply},
+            ]
+            yield streaming_h, None, None
+
+            # Submit complete sentences to TTS pool immediately
+            complete, pending_text = _extract_complete_sentences(pending_text)
+            for sent in complete:
+                if sent.strip():
+                    print(f"  🔊 TTS submit: {sent[:60]}...")
+                    fut = pool.submit(
+                        _tts_worker, model, sent,
+                        tts_model_type, tts_language,
+                        exaggeration, cfg_weight, speed_factor, model.sr, int(cfm_steps),
+                    )
+                    tts_futures.append(fut)
+
+        # Submit remaining text
+        if pending_text.strip():
+            print(f"  🔊 TTS submit (final): {pending_text[:60]}...")
+            fut = pool.submit(
+                _tts_worker, model, pending_text.strip(),
+                tts_model_type, tts_language,
+                exaggeration, cfg_weight, speed_factor, model.sr, int(cfm_steps),
+            )
+            tts_futures.append(fut)
+
+        print(f"  💬 LLM: {full_reply[:80]}... | {len(tts_futures)} TTS chunks en pipeline")
+
+        final_h = chat_history + [
             {"role": "user", "content": user_message},
             {"role": "assistant", "content": full_reply},
         ]
-        yield streaming_h, None, None
 
-    print(f"  💬 LLM: {full_reply[:80]}...")
-
-    final_h = chat_history + [
-        {"role": "user", "content": user_message},
-        {"role": "assistant", "content": full_reply},
-    ]
-
-    # Phase 2: Streaming TTS sentence-by-sentence
-    sentences = split_sentences(full_reply) or [full_reply]
-    for i, sentence in enumerate(sentences):
-        print(f"  🔊 TTS [{i+1}/{len(sentences)}]: {sentence[:60]}...")
-        wav = _tts_generate(model, sentence, tts_model_type, tts_language, exaggeration, cfg_weight)
-        wav_np = wav.squeeze(0).numpy()
-        wav_int16 = (np.clip(wav_np, -1.0, 1.0) * 32767).astype(np.int16)
-        wav_int16, out_sr = _apply_speed(wav_int16, model.sr, speed_factor)
-        yield final_h, (out_sr, wav_int16), None
+        # Yield audio in order as futures complete
+        for i, fut in enumerate(tts_futures):
+            out_sr, wav_int16 = fut.result()
+            print(f"  ✅ TTS [{i+1}/{len(tts_futures)}] listo")
+            yield final_h, (out_sr, wav_int16), None
+    finally:
+        pool.shutdown(wait=False)
 
 
 # --- Manual chat (text + record button, kept as fallback) ---
@@ -680,6 +847,7 @@ def chat_and_speak(
     tts_model_type,
     tts_language,
     speed_factor,
+    cfm_steps,
 ):
     user_message = text_message.strip() if text_message else ""
     if not user_message:
@@ -704,26 +872,51 @@ def chat_and_speak(
         llm_stream = stream_ollama(ollama_model, chat_history, user_message)
 
     full_reply = ""
-    for text_chunk in llm_stream:
-        full_reply += text_chunk
-        streaming_history = chat_history + [
+    pending_text = ""
+    tts_futures = []
+    pool = ThreadPoolExecutor(max_workers=TTS_WORKERS)
+
+    try:
+        for text_chunk in llm_stream:
+            full_reply += text_chunk
+            pending_text += text_chunk
+            streaming_history = chat_history + [
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": full_reply},
+            ]
+            yield streaming_history, None, ""
+
+            # Submit complete sentences to TTS pool immediately
+            complete, pending_text = _extract_complete_sentences(pending_text)
+            for sent in complete:
+                if sent.strip():
+                    fut = pool.submit(
+                        _tts_worker, model, sent,
+                        tts_model_type, tts_language,
+                        exaggeration, cfg_weight, speed_factor, model.sr, int(cfm_steps),
+                    )
+                    tts_futures.append(fut)
+
+        # Submit remaining text
+        if pending_text.strip():
+            fut = pool.submit(
+                _tts_worker, model, pending_text.strip(),
+                tts_model_type, tts_language,
+                exaggeration, cfg_weight, speed_factor, model.sr, int(cfm_steps),
+            )
+            tts_futures.append(fut)
+
+        final_history = chat_history + [
             {"role": "user", "content": user_message},
             {"role": "assistant", "content": full_reply},
         ]
-        yield streaming_history, None, ""
 
-    final_history = chat_history + [
-        {"role": "user", "content": user_message},
-        {"role": "assistant", "content": full_reply},
-    ]
-
-    sentences = split_sentences(full_reply) or [full_reply]
-    for i, sentence in enumerate(sentences):
-        wav = _tts_generate(model, sentence, tts_model_type, tts_language, exaggeration, cfg_weight)
-        wav_np = wav.squeeze(0).numpy()
-        wav_int16 = (np.clip(wav_np, -1.0, 1.0) * 32767).astype(np.int16)
-        wav_int16, out_sr = _apply_speed(wav_int16, model.sr, speed_factor)
-        yield final_history, (out_sr, wav_int16), ""
+        # Yield audio in order as futures complete
+        for fut in tts_futures:
+            out_sr, wav_int16 = fut.result()
+            yield final_history, (out_sr, wav_int16), ""
+    finally:
+        pool.shutdown(wait=False)
 
 
 def refresh_ollama_models():
@@ -793,9 +986,10 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
             gr.Markdown("---")
             gr.Markdown(
                 "#### Voz de referencia\n"
-                "Para español LATAM: **sube un audio de ~10s de alguien "
-                "hablando español latino** (sin música/ruido). "
-                "Si no subes nada, se usa una voz femenina por defecto."
+                "Prioridad: **1)** audio subido aquí → **2)** `voices/default.wav` → "
+                "**3)** voz descargada automáticamente.\n\n"
+                "Para usar tu propia voz LATAM por defecto, coloca un `.wav` de ~10s "
+                "en la carpeta `voices/default.wav` del proyecto."
             )
             ref_audio = gr.Audio(
                 sources=["upload", "microphone"],
@@ -805,6 +999,11 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
             exaggeration = gr.Slider(0.25, 2, step=0.05, value=0.5, label="Exageración")
             cfg_weight = gr.Slider(0.0, 1.0, step=0.05, value=0.5, label="CFG / Ritmo")
             speed_factor = gr.Slider(0.5, 2.0, step=0.05, value=1.0, label="Velocidad de voz")
+            cfm_steps = gr.Slider(
+                2, 10, step=1, value=4,
+                label="Pasos CFM (calidad vs velocidad)",
+                info="Menos pasos = más rápido. 4 = buen balance, 10 = máxima calidad.",
+            )
 
             gr.Markdown("---")
             gr.Markdown("#### Modelo y Idioma TTS")
@@ -909,7 +1108,7 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
         conversation_mic, chatbot,
         backend, api_key, ref_audio, exaggeration, cfg_weight,
         gemini_model, ollama_model, stt_language,
-        tts_model_type, tts_language, speed_factor,
+        tts_model_type, tts_language, speed_factor, cfm_steps,
     ]
     conversation_mic.stop_recording(
         fn=auto_conversation,
@@ -921,7 +1120,7 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
     manual_inputs = [
         backend, api_key, user_input, chatbot,
         ref_audio, exaggeration, cfg_weight, gemini_model, ollama_model,
-        tts_model_type, tts_language, speed_factor,
+        tts_model_type, tts_language, speed_factor, cfm_steps,
     ]
     manual_outputs = [chatbot, audio_output, user_input]
 

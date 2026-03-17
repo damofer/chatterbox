@@ -148,8 +148,9 @@ class S3Token2Mel(torch.nn.Module):
         if ref_sr != S3_SR:
             ref_wav_16 = get_resampler(ref_sr, S3_SR, device)(ref_wav)
 
-        # Speaker embedding
-        ref_x_vector = self.speaker_encoder.inference(ref_wav_16.to(dtype=self.dtype))
+        # Speaker embedding (uses FFT which requires float32)
+        _se_dtype = next(self.speaker_encoder.parameters()).dtype
+        ref_x_vector = self.speaker_encoder.inference(ref_wav_16.to(dtype=_se_dtype))
 
         # Tokenize 16khz reference
         ref_speech_tokens, ref_speech_token_lens = self.tokenizer(ref_wav_16.float())
@@ -203,13 +204,16 @@ class S3Token2Mel(torch.nn.Module):
 
         if ref_dict is None:
             ref_dict = self.embed_ref(ref_wav, ref_sr)
-        else:
-            # type/device casting (all values will be numpy if it's from a prod API call)
-            for rk in list(ref_dict):
-                if isinstance(ref_dict[rk], np.ndarray):
-                    ref_dict[rk] = torch.from_numpy(ref_dict[rk])
-                if torch.is_tensor(ref_dict[rk]):
+        # type/device/dtype casting for all ref_dict values
+        for rk in list(ref_dict):
+            if isinstance(ref_dict[rk], np.ndarray):
+                ref_dict[rk] = torch.from_numpy(ref_dict[rk])
+            if torch.is_tensor(ref_dict[rk]):
+                # Only cast float tensors to model dtype; keep integer tensors (tokens, lengths) as-is
+                if ref_dict[rk].is_floating_point():
                     ref_dict[rk] = ref_dict[rk].to(device=self.device, dtype=self.dtype)
+                else:
+                    ref_dict[rk] = ref_dict[rk].to(device=self.device)
 
         speech_tokens = torch.atleast_2d(speech_tokens)
 

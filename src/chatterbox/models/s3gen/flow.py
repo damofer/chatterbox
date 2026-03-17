@@ -145,8 +145,8 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         # token_len: (B,)
         B = token.size(0)
 
-        # xvec projection
-        embedding = torch.atleast_2d(embedding)
+        # xvec projection (cast to model dtype in case speaker_encoder produced fp32)
+        embedding = torch.atleast_2d(embedding).to(dtype=self.spk_embed_affine_layer.weight.dtype)
         embedding = F.normalize(embedding, dim=1)
         embedding = self.spk_embed_affine_layer(embedding)  # (1 or B, emb_dim)
 
