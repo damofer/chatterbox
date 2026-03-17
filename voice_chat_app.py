@@ -11,6 +11,7 @@ Features:
   - Gemini (cloud) and Ollama (local, free) backends
 """
 
+import json
 import os
 import re
 import shutil
@@ -216,13 +217,14 @@ def retrieve_context(query: str, n_results: int = 3) -> str:
     return "\n---\n".join(context_parts)
 
 
-def _build_rag_system_prompt(user_message: str) -> str:
+def _build_rag_system_prompt(user_message: str, custom_prompt: str = "") -> str:
     """Build system prompt with RAG context injected."""
+    base_prompt = custom_prompt.strip() if custom_prompt and custom_prompt.strip() else SYSTEM_PROMPT
     context = retrieve_context(user_message)
     if not context:
-        return SYSTEM_PROMPT
+        return base_prompt
     return (
-        SYSTEM_PROMPT + "\n\n"
+        base_prompt + "\n\n"
         "A continuación tienes información relevante de la base de conocimiento. "
         "Úsala para responder con precisión. Si la información no es relevante "
         "a la pregunta, ignórala.\n\n"
@@ -365,6 +367,50 @@ SYSTEM_PROMPT = (
     "Responde en el mismo idioma que el usuario escribe."
 )
 
+# --- Persistent configuration ---
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+_CONFIG_DEFAULTS = {
+    "backend": "Ollama",
+    "api_key": os.environ.get("GEMINI_API_KEY", ""),
+    "gemini_model": "gemini-2.0-flash-lite",
+    "ollama_model": "",
+    "exaggeration": 0.5,
+    "cfg_weight": 0.5,
+    "speed_factor": 1.0,
+    "cfm_steps": 4,
+    "tts_model_type": "multilingual",
+    "tts_language": "es",
+    "stt_language": "es",
+    "system_prompt": SYSTEM_PROMPT,
+}
+
+
+def _load_config() -> dict:
+    """Load saved config from disk, falling back to defaults."""
+    cfg = dict(_CONFIG_DEFAULTS)
+    if os.path.isfile(_CONFIG_PATH):
+        try:
+            with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            cfg.update({k: v for k, v in saved.items() if k in _CONFIG_DEFAULTS})
+        except (json.JSONDecodeError, OSError):
+            pass
+    return cfg
+
+
+def _save_config(cfg: dict):
+    """Persist config to disk."""
+    try:
+        with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+# Load once at import time for UI defaults
+_saved_cfg = _load_config()
+
 
 # --- Spanish text normalization ---
 
@@ -469,12 +515,12 @@ def _build_gemini_contents(chat_history, user_message):
     return contents
 
 
-def stream_gemini(api_key, model_name, chat_history, user_message):
+def stream_gemini(api_key, model_name, chat_history, user_message, custom_prompt=""):
     """Stream text from Gemini API."""
     client = genai.Client(api_key=api_key)
     contents = _build_gemini_contents(chat_history, user_message)
     config = genai.types.GenerateContentConfig(
-        system_instruction=_build_rag_system_prompt(user_message),
+        system_instruction=_build_rag_system_prompt(user_message, custom_prompt),
         temperature=0.7,
         max_output_tokens=256,
     )
@@ -496,17 +542,17 @@ def stream_gemini(api_key, model_name, chat_history, user_message):
             )
 
 
-def _build_ollama_messages(chat_history, user_message):
-    messages = [{"role": "system", "content": _build_rag_system_prompt(user_message)}]
+def _build_ollama_messages(chat_history, user_message, custom_prompt=""):
+    messages = [{"role": "system", "content": _build_rag_system_prompt(user_message, custom_prompt)}]
     for msg in chat_history:
         messages.append({"role": msg["role"], "content": msg["content"]})
     messages.append({"role": "user", "content": user_message})
     return messages
 
 
-def stream_ollama(model_name, chat_history, user_message):
+def stream_ollama(model_name, chat_history, user_message, custom_prompt=""):
     """Stream text from local Ollama server."""
-    messages = _build_ollama_messages(chat_history, user_message)
+    messages = _build_ollama_messages(chat_history, user_message, custom_prompt)
     try:
         for chunk in ollama.chat(model=model_name, messages=messages, stream=True):
             if chunk.message.content:
@@ -970,6 +1016,7 @@ def auto_conversation(
     tts_language,
     speed_factor,
     cfm_steps,
+    custom_prompt="",
 ):
     """When user stops recording, auto-transcribe → LLM → TTS."""
     if audio_path is None:
@@ -996,9 +1043,9 @@ def auto_conversation(
         raise gr.Error("Selecciona un modelo Ollama (o descarga uno: ollama pull llama3.2)")
 
     if backend == "Gemini":
-        llm_stream = stream_gemini(api_key, gemini_model, chat_history, user_message)
+        llm_stream = stream_gemini(api_key, gemini_model, chat_history, user_message, custom_prompt)
     else:
-        llm_stream = stream_ollama(ollama_model, chat_history, user_message)
+        llm_stream = stream_ollama(ollama_model, chat_history, user_message, custom_prompt)
 
     # Pipeline: LLM streaming + parallel TTS generation
     full_reply = ""
@@ -1070,6 +1117,7 @@ def chat_and_speak(
     tts_language,
     speed_factor,
     cfm_steps,
+    custom_prompt="",
 ):
     user_message = text_message.strip() if text_message else ""
     if not user_message:
@@ -1089,9 +1137,9 @@ def chat_and_speak(
         raise gr.Error("Selecciona un modelo Ollama (o descarga uno: ollama pull llama3.2)")
 
     if backend == "Gemini":
-        llm_stream = stream_gemini(api_key, gemini_model, chat_history, user_message)
+        llm_stream = stream_gemini(api_key, gemini_model, chat_history, user_message, custom_prompt)
     else:
-        llm_stream = stream_ollama(ollama_model, chat_history, user_message)
+        llm_stream = stream_ollama(ollama_model, chat_history, user_message, custom_prompt)
 
     full_reply = ""
     pending_text = ""
@@ -1199,19 +1247,24 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
 
         # ── Tab 2: Configuración ─────────────────────────────
         with gr.Tab("⚙️ Configuración"):
+            with gr.Row():
+                save_config_btn = gr.Button("💾 Guardar configuración", variant="primary", size="lg")
+                save_config_status = gr.Textbox(show_label=False, interactive=False, scale=2)
+
             with gr.Group():
                 gr.Markdown("#### Backend LLM")
                 backend = gr.Radio(
                     choices=["Gemini", "Ollama"],
-                    value="Ollama",
+                    value=_saved_cfg["backend"],
                     label="Backend LLM",
                 )
+                _is_gemini = _saved_cfg["backend"] == "Gemini"
                 api_key = gr.Textbox(
                     label="Gemini API Key",
                     type="password",
                     placeholder="AIza...",
-                    value=os.environ.get("GEMINI_API_KEY", ""),
-                    visible=False,
+                    value=_saved_cfg["api_key"],
+                    visible=_is_gemini,
                 )
                 gemini_model = gr.Dropdown(
                     choices=[
@@ -1220,16 +1273,20 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
                         "gemini-1.5-flash",
                         "gemini-1.5-pro",
                     ],
-                    value="gemini-2.0-flash-lite",
+                    value=_saved_cfg["gemini_model"],
                     label="Modelo Gemini",
-                    visible=False,
+                    visible=_is_gemini,
                 )
                 ollama_available = get_ollama_models()
+                _saved_ollama = _saved_cfg["ollama_model"]
+                _ollama_val = _saved_ollama if _saved_ollama in ollama_available else (
+                    ollama_available[0] if ollama_available else None
+                )
                 ollama_model = gr.Dropdown(
                     choices=ollama_available,
-                    value=ollama_available[0] if ollama_available else None,
+                    value=_ollama_val,
                     label="Modelo Ollama",
-                    visible=True,
+                    visible=not _is_gemini,
                 )
                 refresh_btn = gr.Button("Actualizar modelos Ollama", visible=True, size="sm")
 
@@ -1246,11 +1303,11 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
                     type="filepath",
                     label="Voz de referencia (WAV/FLAC, ~10s) — opcional para español",
                 )
-                exaggeration = gr.Slider(0.25, 2, step=0.05, value=0.5, label="Exageración")
-                cfg_weight = gr.Slider(0.0, 1.0, step=0.05, value=0.5, label="CFG / Ritmo")
-                speed_factor = gr.Slider(0.5, 2.0, step=0.05, value=1.0, label="Velocidad de voz")
+                exaggeration = gr.Slider(0.25, 2, step=0.05, value=_saved_cfg["exaggeration"], label="Exageración")
+                cfg_weight = gr.Slider(0.0, 1.0, step=0.05, value=_saved_cfg["cfg_weight"], label="CFG / Ritmo")
+                speed_factor = gr.Slider(0.5, 2.0, step=0.05, value=_saved_cfg["speed_factor"], label="Velocidad de voz")
                 cfm_steps = gr.Slider(
-                    2, 10, step=1, value=4,
+                    2, 10, step=1, value=_saved_cfg["cfm_steps"],
                     label="Pasos CFM (calidad vs velocidad)",
                     info="Menos pasos = más rápido. 4 = buen balance, 10 = máxima calidad.",
                 )
@@ -1262,7 +1319,7 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
                         ("Multilingüe (español nativo + 22 idiomas)", "multilingual"),
                         ("Inglés (original, solo EN)", "english"),
                     ],
-                    value="multilingual",
+                    value=_saved_cfg["tts_model_type"],
                     label="Modelo TTS",
                 )
                 tts_language = gr.Dropdown(
@@ -1291,7 +1348,7 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
                         ("Melayu", "ms"),
                         ("Kiswahili", "sw"),
                     ],
-                    value="es",
+                    value=_saved_cfg["tts_language"],
                     label="Idioma TTS (voz de salida)",
                     info="Idioma en el que el modelo genera la voz. Usa Multilingüe para idiomas != inglés.",
                 )
@@ -1308,7 +1365,7 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
                         ("Português", "pt"),
                         ("Auto-detectar", ""),
                     ],
-                    value="es",
+                    value=_saved_cfg["stt_language"],
                     label="Idioma de voz (STT — reconocimiento)",
                 )
 
@@ -1342,7 +1399,50 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
                     rag_index_btn = gr.Button("📚 Indexar documentos", variant="primary", size="sm")
                 rag_result = gr.Textbox(label="Resultado de indexación", interactive=False)
 
+            with gr.Group():
+                gr.Markdown("#### 🧠 System Prompt")
+                system_prompt_input = gr.Textbox(
+                    label="Instrucciones del sistema",
+                    value=_saved_cfg["system_prompt"],
+                    lines=6,
+                    placeholder="Ingresa las instrucciones para el asistente...",
+                    info="Define la personalidad y comportamiento del asistente. Los cambios se aplican al siguiente mensaje.",
+                )
+
     # --- Event wiring ---
+
+    # Save all config with button
+    def _save_all_config(
+        _backend, _api_key, _gemini_model, _ollama_model,
+        _exaggeration, _cfg_weight, _speed_factor, _cfm_steps,
+        _tts_model_type, _tts_language, _stt_language, _system_prompt,
+    ):
+        cfg = {
+            "backend": _backend,
+            "api_key": _api_key,
+            "gemini_model": _gemini_model,
+            "ollama_model": _ollama_model or "",
+            "exaggeration": _exaggeration,
+            "cfg_weight": _cfg_weight,
+            "speed_factor": _speed_factor,
+            "cfm_steps": _cfm_steps,
+            "tts_model_type": _tts_model_type,
+            "tts_language": _tts_language,
+            "stt_language": _stt_language,
+            "system_prompt": _system_prompt,
+        }
+        _save_config(cfg)
+        return "✅ Configuración guardada"
+
+    save_config_btn.click(
+        fn=_save_all_config,
+        inputs=[
+            backend, api_key, gemini_model, ollama_model,
+            exaggeration, cfg_weight, speed_factor, cfm_steps,
+            tts_model_type, tts_language, stt_language, system_prompt_input,
+        ],
+        outputs=[save_config_status],
+    )
 
     # Toggle backend visibility
     backend.change(
@@ -1350,6 +1450,7 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
         inputs=[backend],
         outputs=[api_key, gemini_model, ollama_model, refresh_btn],
     )
+
     refresh_btn.click(fn=refresh_ollama_models, outputs=[ollama_model])
 
     # RAG: upload files → update status → update dropdown
@@ -1396,6 +1497,7 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
         backend, api_key, ref_audio, exaggeration, cfg_weight,
         gemini_model, ollama_model, stt_language,
         tts_model_type, tts_language, speed_factor, cfm_steps,
+        system_prompt_input,
     ]
     conversation_mic.stop_recording(
         fn=auto_conversation,
@@ -1408,6 +1510,7 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
         backend, api_key, user_input, chatbot,
         ref_audio, exaggeration, cfg_weight, gemini_model, ollama_model,
         tts_model_type, tts_language, speed_factor, cfm_steps,
+        system_prompt_input,
     ]
     manual_outputs = [chatbot, audio_output, user_input]
 
@@ -1416,6 +1519,40 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
     clear_btn.click(
         lambda: ([], None, ""),
         outputs=[chatbot, audio_output, user_input],
+    )
+
+    # --- Restore saved config on every page load/refresh ---
+    def _restore_config():
+        cfg = _load_config()
+        is_gemini = cfg["backend"] == "Gemini"
+        ollama_models = get_ollama_models()
+        saved_ollama = cfg["ollama_model"]
+        ollama_val = saved_ollama if saved_ollama in ollama_models else (
+            ollama_models[0] if ollama_models else None
+        )
+        return (
+            gr.update(value=cfg["backend"]),
+            gr.update(value=cfg["api_key"], visible=is_gemini),
+            gr.update(value=cfg["gemini_model"], visible=is_gemini),
+            gr.update(value=ollama_val, choices=ollama_models, visible=not is_gemini),
+            gr.update(visible=not is_gemini),  # refresh_btn
+            gr.update(value=cfg["exaggeration"]),
+            gr.update(value=cfg["cfg_weight"]),
+            gr.update(value=cfg["speed_factor"]),
+            gr.update(value=cfg["cfm_steps"]),
+            gr.update(value=cfg["tts_model_type"]),
+            gr.update(value=cfg["tts_language"]),
+            gr.update(value=cfg["stt_language"]),
+            gr.update(value=cfg["system_prompt"]),
+        )
+
+    demo.load(
+        fn=_restore_config,
+        outputs=[
+            backend, api_key, gemini_model, ollama_model, refresh_btn,
+            exaggeration, cfg_weight, speed_factor, cfm_steps,
+            tts_model_type, tts_language, stt_language, system_prompt_input,
+        ],
     )
 
 
