@@ -29,6 +29,7 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
+/knowledge
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -46,3 +47,6 @@ checkpoints/
 
 # Ignore generated sample .wav files
 **/*.wav
+knowledge/.chroma/chroma.sqlite3
+knowledge/.chroma/chroma.sqlite3
+knowledge/.chroma/chroma.sqlite3

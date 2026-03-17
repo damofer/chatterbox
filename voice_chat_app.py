@@ -43,6 +43,12 @@ import ollama
 from chatterbox.tts import ChatterboxTTS
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
 
+# RAG dependencies
+import glob
+import fitz  # PyMuPDF
+import chromadb
+from sentence_transformers import SentenceTransformer
+
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -57,6 +63,222 @@ _VOICES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voices")
 _LOCAL_DEFAULT_REF = os.path.join(_VOICES_DIR, "default.wav")
 _DEFAULT_ES_REF_URL = "https://storage.googleapis.com/chatterbox-demo-samples/mtl_prompts/es_f1.flac"
 _DEFAULT_ES_REF_PATH = os.path.join(tempfile.gettempdir(), "chatterbox_es_latam_ref.flac")
+
+# ───────────────────────────────────────────
+# RAG — Knowledge Base
+# ───────────────────────────────────────────
+_KNOWLEDGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge")
+_CHROMA_DIR = os.path.join(_KNOWLEDGE_DIR, ".chroma")
+os.makedirs(_KNOWLEDGE_DIR, exist_ok=True)
+
+_embed_model: SentenceTransformer | None = None
+_chroma_collection = None
+_rag_enabled = False
+
+
+def _get_embed_model():
+    """Lazy-load the embedding model (runs on CPU to keep GPU for TTS)."""
+    global _embed_model
+    if _embed_model is None:
+        print("Cargando modelo de embeddings para RAG...")
+        _embed_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+        print("✅ Modelo de embeddings cargado")
+    return _embed_model
+
+
+def _read_txt(path: str) -> str:
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+
+def _read_pdf(path: str) -> str:
+    text_parts = []
+    with fitz.open(path) as doc:
+        for page in doc:
+            text_parts.append(page.get_text())
+    return "\n".join(text_parts)
+
+
+def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
+    """Split text into overlapping chunks by character count."""
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start += chunk_size - overlap
+    return chunks
+
+
+def index_knowledge_base() -> str:
+    """Scan knowledge/ for PDF and TXT files, chunk, embed, and store in ChromaDB."""
+    global _chroma_collection, _rag_enabled
+
+    files = glob.glob(os.path.join(_KNOWLEDGE_DIR, "**/*.pdf"), recursive=True) + \
+            glob.glob(os.path.join(_KNOWLEDGE_DIR, "**/*.txt"), recursive=True)
+    # Exclude README.txt
+    files = [f for f in files if os.path.basename(f).lower() != "readme.txt"]
+
+    if not files:
+        _rag_enabled = False
+        return "⚠️ No se encontraron archivos PDF o TXT en knowledge/"
+
+    embed_model = _get_embed_model()
+
+    # Create/reset ChromaDB
+    client = chromadb.PersistentClient(path=_CHROMA_DIR)
+    # Delete old collection if exists
+    try:
+        client.delete_collection("knowledge")
+    except Exception:
+        pass
+    collection = client.create_collection(
+        name="knowledge",
+        metadata={"hnsw:space": "cosine"},
+    )
+
+    all_chunks = []
+    all_ids = []
+    all_metas = []
+    doc_count = 0
+
+    for fpath in files:
+        fname = os.path.basename(fpath)
+        ext = os.path.splitext(fname)[1].lower()
+        try:
+            if ext == ".pdf":
+                raw = _read_pdf(fpath)
+            else:
+                raw = _read_txt(fpath)
+        except Exception as e:
+            print(f"⚠️ Error leyendo {fname}: {e}")
+            continue
+
+        if not raw.strip():
+            continue
+
+        chunks = _chunk_text(raw)
+        for i, chunk in enumerate(chunks):
+            all_chunks.append(chunk)
+            all_ids.append(f"{fname}_{i}")
+            all_metas.append({"source": fname, "chunk_idx": i})
+        doc_count += 1
+        print(f"  📄 {fname}: {len(chunks)} fragmentos")
+
+    if not all_chunks:
+        _rag_enabled = False
+        return "⚠️ Los archivos no contienen texto extraíble."
+
+    # Embed all chunks
+    print(f"Generando embeddings para {len(all_chunks)} fragmentos...")
+    embeddings = embed_model.encode(all_chunks, show_progress_bar=True, batch_size=64)
+
+    # Add to ChromaDB in batches of 5000 (API limit)
+    batch_size = 5000
+    for i in range(0, len(all_chunks), batch_size):
+        collection.add(
+            ids=all_ids[i:i+batch_size],
+            documents=all_chunks[i:i+batch_size],
+            embeddings=embeddings[i:i+batch_size].tolist(),
+            metadatas=all_metas[i:i+batch_size],
+        )
+
+    _chroma_collection = collection
+    _rag_enabled = True
+    msg = f"✅ Indexados {doc_count} documentos → {len(all_chunks)} fragmentos"
+    print(msg)
+    return msg
+
+
+def retrieve_context(query: str, n_results: int = 3) -> str:
+    """Retrieve relevant document chunks for a user query."""
+    if not _rag_enabled or _chroma_collection is None:
+        return ""
+
+    embed_model = _get_embed_model()
+    query_embedding = embed_model.encode([query]).tolist()
+
+    results = _chroma_collection.query(
+        query_embeddings=query_embedding,
+        n_results=n_results,
+    )
+
+    if not results["documents"] or not results["documents"][0]:
+        return ""
+
+    context_parts = []
+    for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
+        source = meta.get("source", "desconocido")
+        context_parts.append(f"[{source}]: {doc}")
+
+    return "\n---\n".join(context_parts)
+
+
+def _build_rag_system_prompt(user_message: str) -> str:
+    """Build system prompt with RAG context injected."""
+    context = retrieve_context(user_message)
+    if not context:
+        return SYSTEM_PROMPT
+    return (
+        SYSTEM_PROMPT + "\n\n"
+        "A continuación tienes información relevante de la base de conocimiento. "
+        "Úsala para responder con precisión. Si la información no es relevante "
+        "a la pregunta, ignórala.\n\n"
+        f"--- CONTEXTO ---\n{context}\n--- FIN CONTEXTO ---"
+    )
+
+
+def _count_knowledge_files() -> str:
+    """Count PDF and TXT files in knowledge/."""
+    files = _list_knowledge_files()
+    if not files:
+        return "No hay documentos en knowledge/"
+    names = [os.path.basename(f) for f in files]
+    return f"{len(files)} doc(s): {', '.join(names[:10])}{'...' if len(names) > 10 else ''}"
+
+
+def _list_knowledge_files() -> list[str]:
+    """List all PDF and TXT files in knowledge/."""
+    files = glob.glob(os.path.join(_KNOWLEDGE_DIR, "**/*.pdf"), recursive=True) + \
+            glob.glob(os.path.join(_KNOWLEDGE_DIR, "**/*.txt"), recursive=True)
+    return [f for f in files if os.path.basename(f).lower() != "readme.txt"]
+
+
+def _get_doc_choices():
+    """Return gr.update for the document dropdown."""
+    choices = [os.path.basename(f) for f in _list_knowledge_files()]
+    return gr.update(choices=choices, value=None)
+
+
+def upload_knowledge_files(file_paths) -> str:
+    """Copy uploaded files to knowledge/ folder."""
+    if not file_paths:
+        return "⚠️ No se seleccionaron archivos."
+    added = []
+    for fpath in file_paths:
+        fname = os.path.basename(fpath)
+        ext = os.path.splitext(fname)[1].lower()
+        if ext not in (".pdf", ".txt"):
+            continue
+        dest = os.path.join(_KNOWLEDGE_DIR, fname)
+        shutil.copy2(fpath, dest)
+        added.append(fname)
+    if not added:
+        return "⚠️ Solo se aceptan archivos .pdf y .txt"
+    return f"✅ Subidos: {', '.join(added)}"
+
+
+def delete_knowledge_file(filename: str) -> str:
+    """Delete a document from knowledge/ folder."""
+    if not filename:
+        return "⚠️ Selecciona un documento para eliminar."
+    fpath = os.path.join(_KNOWLEDGE_DIR, os.path.basename(filename))
+    if not os.path.isfile(fpath):
+        return f"⚠️ No encontrado: {filename}"
+    os.remove(fpath)
+    return f"🗑️ Eliminado: {filename}"
 
 
 def _ensure_default_es_ref() -> str:
@@ -252,7 +474,7 @@ def stream_gemini(api_key, model_name, chat_history, user_message):
     client = genai.Client(api_key=api_key)
     contents = _build_gemini_contents(chat_history, user_message)
     config = genai.types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
+        system_instruction=_build_rag_system_prompt(user_message),
         temperature=0.7,
         max_output_tokens=256,
     )
@@ -275,7 +497,7 @@ def stream_gemini(api_key, model_name, chat_history, user_message):
 
 
 def _build_ollama_messages(chat_history, user_message):
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": _build_rag_system_prompt(user_message)}]
     for msg in chat_history:
         messages.append({"role": msg["role"], "content": msg["content"]})
     messages.append({"role": "user", "content": user_message})
@@ -1061,6 +1283,36 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
                 label="Idioma de voz (STT — reconocimiento)",
             )
 
+            gr.Markdown("---")
+            gr.Markdown("#### 📚 Base de Conocimiento (RAG)")
+            gr.Markdown(
+                "Sube archivos **PDF** o **TXT** para que el asistente "
+                "use esa información al responder."
+            )
+            rag_upload = gr.File(
+                label="Subir documentos (PDF / TXT)",
+                file_types=[".pdf", ".txt"],
+                file_count="multiple",
+                type="filepath",
+            )
+            rag_upload_result = gr.Textbox(label="Resultado", interactive=False)
+            rag_status = gr.Textbox(
+                label="Documentos cargados",
+                value=_count_knowledge_files(),
+                interactive=False,
+            )
+            with gr.Row():
+                rag_doc_select = gr.Dropdown(
+                    choices=[os.path.basename(f) for f in _list_knowledge_files()],
+                    label="Seleccionar documento",
+                    allow_custom_value=False,
+                    scale=3,
+                )
+                rag_delete_btn = gr.Button("🗑️ Eliminar", size="sm", variant="stop", scale=1)
+            with gr.Row():
+                rag_index_btn = gr.Button("📚 Indexar documentos", variant="primary", size="sm")
+            rag_result = gr.Textbox(label="Resultado de indexación", interactive=False)
+
         # Right column — chat
         with gr.Column(scale=2):
             chatbot = gr.Chatbot(label="Conversación", height=400, type="messages")
@@ -1103,6 +1355,44 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
     )
     refresh_btn.click(fn=refresh_ollama_models, outputs=[ollama_model])
 
+    # RAG: upload files → update status → update dropdown
+    rag_upload.change(
+        fn=upload_knowledge_files,
+        inputs=[rag_upload],
+        outputs=[rag_upload_result],
+    ).then(
+        fn=_count_knowledge_files,
+        outputs=[rag_status],
+    ).then(
+        fn=_get_doc_choices,
+        outputs=[rag_doc_select],
+    )
+
+    # RAG: delete file → update status → update dropdown
+    rag_delete_btn.click(
+        fn=delete_knowledge_file,
+        inputs=[rag_doc_select],
+        outputs=[rag_upload_result],
+    ).then(
+        fn=_count_knowledge_files,
+        outputs=[rag_status],
+    ).then(
+        fn=_get_doc_choices,
+        outputs=[rag_doc_select],
+    )
+
+    # RAG: indexing
+    rag_index_btn.click(
+        fn=index_knowledge_base,
+        outputs=[rag_result],
+    ).then(
+        fn=_count_knowledge_files,
+        outputs=[rag_status],
+    ).then(
+        fn=_get_doc_choices,
+        outputs=[rag_doc_select],
+    )
+
     # Conversation mode: record → stop → auto-process
     conv_inputs = [
         conversation_mic, chatbot,
@@ -1134,4 +1424,11 @@ with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
 
 if __name__ == "__main__":
     load_tts("multilingual")  # Pre-load multilingual model at startup
+    # Auto-index knowledge base if documents exist
+    _kb_files = glob.glob(os.path.join(_KNOWLEDGE_DIR, "**/*.pdf"), recursive=True) + \
+                glob.glob(os.path.join(_KNOWLEDGE_DIR, "**/*.txt"), recursive=True)
+    _kb_files = [f for f in _kb_files if os.path.basename(f).lower() != "readme.txt"]
+    if _kb_files:
+        print(f"Indexando {len(_kb_files)} documentos de knowledge/...")
+        index_knowledge_base()
     demo.queue(max_size=20, default_concurrency_limit=1).launch(share=True)
