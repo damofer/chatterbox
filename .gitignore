@@ -50,3 +50,4 @@ checkpoints/
 knowledge/.chroma/chroma.sqlite3
 knowledge/.chroma/chroma.sqlite3
 knowledge/.chroma/chroma.sqlite3
+installer_build

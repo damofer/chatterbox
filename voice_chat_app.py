@@ -1207,7 +1207,7 @@ def toggle_backend(choice):
 
 
 # --- Gradio UI ---
-with gr.Blocks(title="Chat de Voz — IA + Chatterbox") as demo:
+with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
    
 
     # Conversation state (VAD buffer, flags, etc.)
@@ -1565,4 +1565,4 @@ if __name__ == "__main__":
     if _kb_files:
         print(f"Indexando {len(_kb_files)} documentos de knowledge/...")
         index_knowledge_base()
-    demo.queue(max_size=20, default_concurrency_limit=1).launch(share=True)
+    demo.queue(max_size=20, default_concurrency_limit=1).launch(share=True, favicon_path="laris_logo.png")

@@ -1,9 +1,9 @@
 @echo off
 chcp 65001 >nul
-title Instalador - Chat de Voz IA + Chatterbox TTS
+title Instalador - Laris + Chatterbox TTS
 
 echo ============================================
-echo   Chat de Voz IA + Chatterbox TTS
+echo   Laris + Chatterbox TTS
 echo   Instalador para Windows
 echo ============================================
 echo.
@@ -78,12 +78,12 @@ echo [4/4] Creando acceso directo...
 (
     echo @echo off
     echo chcp 65001 ^>nul
-    echo title Chat de Voz IA
+    echo title Laris — Asistente de Voz IA
     echo cd /d "%%~dp0"
     echo call .venv\Scripts\activate.bat
     echo python voice_chat_app.py
     echo pause
-) > "Iniciar Chat de Voz.bat"
+) > "Iniciar Laris.bat"
 
 :: Create directories
 if not exist "voices" mkdir voices
@@ -95,7 +95,7 @@ echo   Instalacion completada!
 echo ============================================
 echo.
 echo   Para iniciar la app:
-echo     - Doble clic en "Iniciar Chat de Voz.bat"
+echo     - Doble clic en "Iniciar Laris.bat"
 echo     - O ejecuta: python voice_chat_app.py
 echo.
 echo   Requisitos opcionales:

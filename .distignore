@@ -1,0 +1,15 @@
+# Ignorar en distribucion
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+config.json
+knowledge/.chroma/
+knowledge/*.pdf
+knowledge/*.txt
+!knowledge/README.txt
+*.log
+.gitignore
