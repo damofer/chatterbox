@@ -56,6 +56,7 @@ from google.genai import errors as genai_errors
 import ollama
 from chatterbox.tts import ChatterboxTTS
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
+from agent_orchestrator import agent_stream_gemini, agent_stream_ollama
 
 # RAG dependencies
 import glob
@@ -396,6 +397,7 @@ _CONFIG_DEFAULTS = {
     "tts_language": "es",
     "stt_language": "es",
     "system_prompt": SYSTEM_PROMPT,
+    "agent_mode": False,
 }
 
 
@@ -862,6 +864,12 @@ def _extract_complete_sentences(pending):
     return parts[:-1], parts[-1]
 
 
+def _is_agent_status(text):
+    """Check if text is an agent status marker (should not be sent to TTS)."""
+    stripped = text.strip()
+    return stripped.startswith("🔧") or stripped.startswith("📋")
+
+
 def _apply_speed(wav_np, sr, speed_factor):
     """Change audio speed by resampling."""
     if speed_factor == 1.0:
@@ -1088,6 +1096,7 @@ def auto_conversation(
     speed_factor,
     cfm_steps,
     custom_prompt="",
+    agent_mode=False,
 ):
     """When user stops recording, auto-transcribe → LLM → TTS."""
     if audio_path is None:
@@ -1117,9 +1126,17 @@ def auto_conversation(
         raise gr.Error("Selecciona un modelo Ollama (o descarga uno: ollama pull llama3.2)")
 
     if backend == "Gemini":
-        llm_stream = stream_gemini(api_key, gemini_model, chat_history, user_message, custom_prompt)
+        if agent_mode:
+            rag_prompt = _build_rag_system_prompt(user_message, custom_prompt)
+            llm_stream = agent_stream_gemini(api_key, gemini_model, chat_history, user_message, rag_prompt)
+        else:
+            llm_stream = stream_gemini(api_key, gemini_model, chat_history, user_message, custom_prompt)
     else:
-        llm_stream = stream_ollama(ollama_model, chat_history, user_message, custom_prompt)
+        if agent_mode:
+            rag_prompt = _build_rag_system_prompt(user_message, custom_prompt)
+            llm_stream = agent_stream_ollama(ollama_model, chat_history, user_message, rag_prompt)
+        else:
+            llm_stream = stream_ollama(ollama_model, chat_history, user_message, custom_prompt)
 
     # Pipeline: LLM streaming + parallel TTS generation
     full_reply = ""
@@ -1133,7 +1150,9 @@ def auto_conversation(
                 print(f"  ⏹️ LLM cancelado (nueva solicitud recibida)")
                 break
             full_reply += text_chunk
-            pending_text += text_chunk
+            # Agent status markers (🔧/📋) show in chat but skip TTS
+            if not _is_agent_status(text_chunk):
+                pending_text += text_chunk
             streaming_h = chat_history + [
                 {"role": "user", "content": user_message},
                 {"role": "assistant", "content": full_reply},
@@ -1229,6 +1248,7 @@ def chat_and_speak(
     speed_factor,
     cfm_steps,
     custom_prompt="",
+    agent_mode=False,
 ):
     user_message = text_message.strip() if text_message else ""
     if not user_message:
@@ -1251,9 +1271,17 @@ def chat_and_speak(
         raise gr.Error("Selecciona un modelo Ollama (o descarga uno: ollama pull llama3.2)")
 
     if backend == "Gemini":
-        llm_stream = stream_gemini(api_key, gemini_model, chat_history, user_message, custom_prompt)
+        if agent_mode:
+            rag_prompt = _build_rag_system_prompt(user_message, custom_prompt)
+            llm_stream = agent_stream_gemini(api_key, gemini_model, chat_history, user_message, rag_prompt)
+        else:
+            llm_stream = stream_gemini(api_key, gemini_model, chat_history, user_message, custom_prompt)
     else:
-        llm_stream = stream_ollama(ollama_model, chat_history, user_message, custom_prompt)
+        if agent_mode:
+            rag_prompt = _build_rag_system_prompt(user_message, custom_prompt)
+            llm_stream = agent_stream_ollama(ollama_model, chat_history, user_message, rag_prompt)
+        else:
+            llm_stream = stream_ollama(ollama_model, chat_history, user_message, custom_prompt)
 
     full_reply = ""
     pending_text = ""
@@ -1266,7 +1294,9 @@ def chat_and_speak(
                 print(f"  ⏹️ LLM cancelado (nueva solicitud recibida)")
                 break
             full_reply += text_chunk
-            pending_text += text_chunk
+            # Agent status markers (🔧/📋) show in chat but skip TTS
+            if not _is_agent_status(text_chunk):
+                pending_text += text_chunk
             streaming_history = chat_history + [
                 {"role": "user", "content": user_message},
                 {"role": "assistant", "content": full_reply},
@@ -1442,6 +1472,14 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
                 refresh_btn = gr.Button("Actualizar modelos Ollama", visible=True, size="sm")
 
             with gr.Group():
+                gr.Markdown("#### 🤖 Modo Agente")
+                agent_mode = gr.Checkbox(
+                    label="Activar modo agente (ejecución de herramientas)",
+                    value=_saved_cfg["agent_mode"],
+                    info="Permite al asistente ejecutar comandos, leer archivos, buscar en la web y más.",
+                )
+
+            with gr.Group():
                 gr.Markdown(
                     "#### Voz de referencia\n"
                     "Prioridad: **1)** audio subido aquí → **2)** `voices/default.wav` → "
@@ -1567,6 +1605,7 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
         _backend, _api_key, _gemini_model, _ollama_model,
         _exaggeration, _cfg_weight, _speed_factor, _cfm_steps,
         _tts_model_type, _tts_language, _stt_language, _system_prompt,
+        _agent_mode,
     ):
         cfg = {
             "backend": _backend,
@@ -1581,6 +1620,7 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
             "tts_language": _tts_language,
             "stt_language": _stt_language,
             "system_prompt": _system_prompt,
+            "agent_mode": _agent_mode,
         }
         _save_config(cfg)
         return "✅ Configuración guardada"
@@ -1591,6 +1631,7 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
             backend, api_key, gemini_model, ollama_model,
             exaggeration, cfg_weight, speed_factor, cfm_steps,
             tts_model_type, tts_language, stt_language, system_prompt_input,
+            agent_mode,
         ],
         outputs=[save_config_status],
     )
@@ -1648,7 +1689,7 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
         backend, api_key, ref_audio, exaggeration, cfg_weight,
         gemini_model, ollama_model, stt_language,
         tts_model_type, tts_language, speed_factor, cfm_steps,
-        system_prompt_input,
+        system_prompt_input, agent_mode,
     ]
     conv_event = conversation_mic.stop_recording(
         fn=auto_conversation,
@@ -1672,7 +1713,7 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
         backend, api_key, user_input, chatbot,
         ref_audio, exaggeration, cfg_weight, gemini_model, ollama_model,
         tts_model_type, tts_language, speed_factor, cfm_steps,
-        system_prompt_input,
+        system_prompt_input, agent_mode,
     ]
     manual_outputs = [chatbot, audio_output, user_input]
 
@@ -1714,6 +1755,7 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
             gr.update(value=cfg["tts_language"]),
             gr.update(value=cfg["stt_language"]),
             gr.update(value=cfg["system_prompt"]),
+            gr.update(value=cfg["agent_mode"]),
         )
 
     demo.load(
@@ -1722,6 +1764,7 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
             backend, api_key, gemini_model, ollama_model, refresh_btn,
             exaggeration, cfg_weight, speed_factor, cfm_steps,
             tts_model_type, tts_language, stt_language, system_prompt_input,
+            agent_mode,
         ],
     )
 
