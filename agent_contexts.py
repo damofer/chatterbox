@@ -33,6 +33,7 @@ NUNCA escribas "Ejecutando: herramienta(...)" como texto — eso no funciona.
 REGLAS FUNDAMENTALES:
 - NUNCA inventes datos. Si no has usado una herramienta para obtener un dato, NO lo sabes.
 - NUNCA inventes URLs. Si no obtuviste una URL de una herramienta, NO la conoces.
+- Para buscar informacion en internet → usa google_search o deep_search. NUNCA inventes una URL para web_fetch.
 - NUNCA preguntes "¿quieres que lo haga?" — simplemente hazlo.
 - NUNCA hagas acciones que el usuario NO pidió.
 - Responde en el idioma que usa el usuario.
@@ -147,13 +148,28 @@ Herramientas disponibles para esta tarea:
 - run_command: Ejecuta un comando en terminal (PowerShell en Windows).
 - datetime: Obtiene la fecha y hora actual.
 - python_eval: Evalúa expresiones matemáticas o de Python.
-- web_fetch: Descarga contenido de una URL.
+- google_search: Busca en internet y devuelve resultados con URLs reales.
+- deep_search: Investigacion profunda — busca en internet y lee multiples paginas.
+- web_fetch: Descarga contenido de una URL CONOCIDA (no inventes URLs).
 
 REGLAS:
 1. Para la hora/fecha → usa datetime inmediatamente.
 2. Para cálculos → usa python_eval.
 3. Para comandos del sistema → usa run_command.
 4. NUNCA inventes la hora, la fecha ni resultados de cálculos.
+5. Para buscar informacion en internet → usa google_search. NUNCA inventes URLs para web_fetch.
+6. Para investigacion profunda (multiples fuentes) → usa deep_search.
+7. Solo usa web_fetch con URLs que obtuviste de google_search u otra herramienta.
+
+EJEMPLO — "busca en google que es X":
+```tool_call
+{"tool": "google_search", "params": {"query": "que es X"}}
+```
+
+EJEMPLO — "investiga a fondo sobre X":
+```tool_call
+{"tool": "deep_search", "params": {"query": "X informacion detallada"}}
+```
 
 EJEMPLO — hora:
 ```tool_call
@@ -220,10 +236,11 @@ _INTENT_PATTERNS = [
      r"youtube|busca.*video|pon.*video|reproduce|reproducir|primer enlace|primer resultado|"
      r"paus[ae]|reanud[ae]|deten(er|te|lo)?|par[ae].*video|quit[ae].*video|"
      r"para el video|para la musica|silencia)\b", "apps"),
-    # System / utilities
+    # System / utilities / web search
     (r"\b(hora|fecha|tiempo|dia|que hora|que dia|calcul[ae]|cuanto es|matematica|"
      r"comando|terminal|consola|instala|pip|npm|web|url|pagina|api|"
-     r"proceso|servicio|sistema|version)\b", "system"),
+     r"proceso|servicio|sistema|version|"
+     r"google|investig|averigua|deep.?search|busca.*(google|internet|web|informacion))\b", "system"),
 ]
 
 _COMPILED_PATTERNS = [(re.compile(p, re.IGNORECASE), key) for p, key in _INTENT_PATTERNS]

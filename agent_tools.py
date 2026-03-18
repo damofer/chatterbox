@@ -252,6 +252,70 @@ def tool_get_datetime(params: dict) -> str:
     return now.strftime("%Y-%m-%d %H:%M:%S (%A)")
 
 
+def tool_google_search(params: dict) -> str:
+    """Search the web via DuckDuckGo and return top results."""
+    query = params.get("query", "").strip()
+    if not query:
+        return "Error: no se proporcionó query de búsqueda."
+    try:
+        data = urllib.parse.urlencode({"q": query, "b": ""}).encode()
+        req = urllib.request.Request(
+            "https://html.duckduckgo.com/html/",
+            data=data,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read(200_000).decode("utf-8", errors="replace")
+        # Extract result links and snippets
+        link_re = re.compile(r'class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>', re.DOTALL)
+        snip_re = re.compile(r'class="result__snippet"[^>]*>(.*?)</a>', re.DOTALL)
+        raw_links = link_re.findall(html)
+        raw_snippets = snip_re.findall(html)
+        results = []
+        for i, (href, raw_title) in enumerate(raw_links[:5]):
+            title = re.sub(r'<[^>]+>', '', raw_title).strip()
+            snippet = ""
+            if i < len(raw_snippets):
+                snippet = re.sub(r'<[^>]+>', '', raw_snippets[i]).strip()
+            # Decode the real URL from DuckDuckGo redirect
+            url_m = re.search(r'uddg=([^&]+)', href)
+            real_url = urllib.parse.unquote(url_m.group(1)) if url_m else href
+            results.append(f"{i+1}. {title}\n   {real_url}\n   {snippet}")
+        if not results:
+            return f"No se encontraron resultados para: {query}"
+        return f"Resultados para '{query}':\n\n" + "\n\n".join(results)
+    except Exception as e:
+        return f"Error en búsqueda web: {e}"
+
+
+def tool_deep_search(params: dict) -> str:
+    """Deep research: search the web, then fetch and compile content from top results."""
+    query = params.get("query", "").strip()
+    if not query:
+        return "Error: no se proporcionó tema de investigación."
+    # Step 1: Search
+    search_text = tool_google_search({"query": query})
+    # Step 2: Extract URLs from search results
+    urls = re.findall(r'\n   (https?://\S+)\n', search_text)
+    # Step 3: Fetch top pages (skip social media / video sites)
+    _skip = ("youtube.com", "twitter.com", "facebook.com", "instagram.com", "tiktok.com")
+    compiled = [search_text, "\n--- Contenido detallado ---\n"]
+    fetched = 0
+    for url in urls:
+        if any(d in url for d in _skip):
+            continue
+        content = tool_web_search({"url": url})
+        if content and not content.startswith("Error"):
+            compiled.append(f"\n[Fuente: {url}]\n{content[:2500]}\n")
+            fetched += 1
+        if fetched >= 3:
+            break
+    full = "\n".join(compiled)
+    return full[:8000]
+
+
 def tool_web_search(params: dict) -> str:
     """Simple web fetch — retrieves text from a URL."""
     url = params.get("url", "").strip()
@@ -1088,6 +1152,30 @@ TOOLS = [
             },
         },
         "function": tool_youtube_control,
+    },
+    {
+        "name": "google_search",
+        "description": (
+            "Busca en internet (Google/DuckDuckGo) y devuelve los primeros 5 resultados con titulo, URL y descripcion. "
+            "Usalo cuando el usuario pida buscar informacion en Google, en internet, en la web, o investigar algo. "
+            "NUNCA uses web_fetch inventando una URL. SIEMPRE usa google_search primero para encontrar las URLs reales."
+        ),
+        "parameters": {
+            "query": {"type": "string", "description": "Texto a buscar en internet", "required": True},
+        },
+        "function": tool_google_search,
+    },
+    {
+        "name": "deep_search",
+        "description": (
+            "Investigacion profunda: busca en internet y luego lee el contenido de las paginas mas relevantes. "
+            "Devuelve los resultados de busqueda MAS el contenido extraido de hasta 3 paginas. "
+            "Usalo cuando el usuario pida investigar a fondo, deep search, o necesite informacion detallada de multiples fuentes."
+        ),
+        "parameters": {
+            "query": {"type": "string", "description": "Tema o pregunta a investigar", "required": True},
+        },
+        "function": tool_deep_search,
     },
     {
         "name": "save_last_result",
