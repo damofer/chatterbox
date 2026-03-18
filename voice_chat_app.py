@@ -396,6 +396,7 @@ _CONFIG_DEFAULTS = {
     "tts_model_type": "multilingual",
     "tts_language": "es",
     "stt_language": "es",
+    "stt_model": "openai/whisper-large-v3-turbo",
     "system_prompt": SYSTEM_PROMPT,
     "agent_mode": False,
 }
@@ -590,31 +591,34 @@ def get_ollama_models():
 # --- Transcription (Speech-to-Text) ---
 
 _whisper_pipe = None
+_whisper_model_name = None
 
-def transcribe(audio_path, language="es"):
+def transcribe(audio_path, language="es", model_name="openai/whisper-large-v3-turbo"):
     """Transcribe audio using Whisper via transformers pipeline."""
-    global _whisper_pipe
+    global _whisper_pipe, _whisper_model_name
     if audio_path is None:
         return ""
-    if _whisper_pipe is None:
+    # Reload pipeline if model changed
+    if _whisper_pipe is None or model_name != _whisper_model_name:
         from transformers import pipeline
-        print("Loading Whisper model for speech-to-text...")
+        print(f"Loading Whisper model: {model_name}...")
         _whisper_pipe = pipeline(
             "automatic-speech-recognition",
-            model="openai/whisper-base",
+            model=model_name,
             device=DEVICE,
         )
+        _whisper_model_name = model_name
     generate_kwargs = {"language": language} if language else {}
     result = _whisper_pipe(audio_path, generate_kwargs=generate_kwargs, return_timestamps=True)
     return result["text"].strip()
 
 
-def transcribe_numpy(audio_np, sr, language="es"):
+def transcribe_numpy(audio_np, sr, language="es", model_name="openai/whisper-large-v3-turbo"):
     """Transcribe audio from numpy array."""
     tmp = tempfile.mktemp(suffix=".wav")
     try:
         sf.write(tmp, audio_np, sr)
-        return transcribe(tmp, language=language)
+        return transcribe(tmp, language=language, model_name=model_name)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -911,6 +915,7 @@ def conversation_stream(
     gemini_model,
     ollama_model,
     stt_language,
+    stt_model,
     vad_energy_gate,
     vad_speech_threshold,
     vad_silence_chunks,
@@ -1002,7 +1007,7 @@ def conversation_stream(
         print(f"🎤 Speech detected ({len(full_audio)/sr:.1f}s), processing...")
 
         # Transcribe
-        user_message = transcribe_numpy(full_audio, sr, language=stt_language)
+        user_message = transcribe_numpy(full_audio, sr, language=stt_language, model_name=stt_model)
         if not user_message or len(user_message.strip()) < 2:
             print("  (empty transcription, ignoring)")
             conv_state["processing"] = False
@@ -1091,6 +1096,7 @@ def auto_conversation(
     gemini_model,
     ollama_model,
     stt_language,
+    stt_model,
     tts_model_type,
     tts_language,
     speed_factor,
@@ -1106,7 +1112,7 @@ def auto_conversation(
     gen_id = _new_generation_id()
 
     # Transcribe
-    user_message = transcribe(audio_path, language=stt_language)
+    user_message = transcribe(audio_path, language=stt_language, model_name=stt_model)
     if not user_message or len(user_message.strip()) < 2:
         return chat_history, None, None
 
@@ -1543,7 +1549,7 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
                 )
 
             with gr.Group():
-                gr.Markdown("#### Idioma de reconocimiento de voz")
+                gr.Markdown("#### Reconocimiento de voz (STT)")
                 stt_language = gr.Dropdown(
                     choices=[
                         ("Español (Latinoamérica)", "es"),
@@ -1556,6 +1562,18 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
                     ],
                     value=_saved_cfg["stt_language"],
                     label="Idioma de voz (STT — reconocimiento)",
+                )
+                stt_model = gr.Dropdown(
+                    choices=[
+                        ("Whisper Large V3 Turbo (rápido, muy preciso)", "openai/whisper-large-v3-turbo"),
+                        ("Whisper Large V3 (más preciso, más lento)", "openai/whisper-large-v3"),
+                        ("Whisper Medium (equilibrado)", "openai/whisper-medium"),
+                        ("Whisper Small (ligero)", "openai/whisper-small"),
+                        ("Whisper Base (muy ligero, menos preciso)", "openai/whisper-base"),
+                    ],
+                    value=_saved_cfg["stt_model"],
+                    label="Modelo STT",
+                    info="Modelos más grandes reconocen mejor palabras en otros idiomas (ej: nombres en inglés).",
                 )
 
             with gr.Group():
@@ -1604,7 +1622,7 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
     def _save_all_config(
         _backend, _api_key, _gemini_model, _ollama_model,
         _exaggeration, _cfg_weight, _speed_factor, _cfm_steps,
-        _tts_model_type, _tts_language, _stt_language, _system_prompt,
+        _tts_model_type, _tts_language, _stt_language, _stt_model, _system_prompt,
         _agent_mode,
     ):
         cfg = {
@@ -1619,6 +1637,7 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
             "tts_model_type": _tts_model_type,
             "tts_language": _tts_language,
             "stt_language": _stt_language,
+            "stt_model": _stt_model,
             "system_prompt": _system_prompt,
             "agent_mode": _agent_mode,
         }
@@ -1630,7 +1649,7 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
         inputs=[
             backend, api_key, gemini_model, ollama_model,
             exaggeration, cfg_weight, speed_factor, cfm_steps,
-            tts_model_type, tts_language, stt_language, system_prompt_input,
+            tts_model_type, tts_language, stt_language, stt_model, system_prompt_input,
             agent_mode,
         ],
         outputs=[save_config_status],
@@ -1687,7 +1706,7 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
     conv_inputs = [
         conversation_mic, chatbot,
         backend, api_key, ref_audio, exaggeration, cfg_weight,
-        gemini_model, ollama_model, stt_language,
+        gemini_model, ollama_model, stt_language, stt_model,
         tts_model_type, tts_language, speed_factor, cfm_steps,
         system_prompt_input, agent_mode,
     ]
@@ -1754,6 +1773,7 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
             gr.update(value=cfg["tts_model_type"]),
             gr.update(value=cfg["tts_language"]),
             gr.update(value=cfg["stt_language"]),
+            gr.update(value=cfg["stt_model"]),
             gr.update(value=cfg["system_prompt"]),
             gr.update(value=cfg["agent_mode"]),
         )
@@ -1763,7 +1783,7 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
         outputs=[
             backend, api_key, gemini_model, ollama_model, refresh_btn,
             exaggeration, cfg_weight, speed_factor, cfm_steps,
-            tts_model_type, tts_language, stt_language, system_prompt_input,
+            tts_model_type, tts_language, stt_language, stt_model, system_prompt_input,
             agent_mode,
         ],
     )

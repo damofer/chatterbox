@@ -305,6 +305,23 @@ def agent_stream_ollama(model_name, chat_history, user_message, system_prompt=""
 
         if tool_call:
             tool_name, tool_params = tool_call
+
+            # --- Auto-redirect: open_application("youtube") → youtube_search when user wants to search ---
+            import re as _re
+            if tool_name == "open_application" and tool_params.get("name", "").lower().strip() in ("youtube", "yt"):
+                yt_search_match = _re.search(
+                    r'\bbusca(?:r|me)?\s+(.+?)(?:\s+y\s+(?:abre|pon|reproduce|ponme|abrelo|ponlo|mete)\b|$)',
+                    user_message, _re.IGNORECASE
+                )
+                if not yt_search_match:
+                    # Try broader: anything after "busca" up to end
+                    yt_search_match = _re.search(r'\bbusca(?:r|me)?\s+(.+)', user_message, _re.IGNORECASE)
+                if yt_search_match:
+                    query = yt_search_match.group(1).strip().rstrip('.')
+                    print(f"  🔄 Redirect: open_application(youtube) → youtube_search({query})")
+                    tool_name = "youtube_search"
+                    tool_params = {"query": query}
+
             yield f"\n🔧 Ejecutando: {tool_name}({json.dumps(tool_params, ensure_ascii=False)[:100]})\n"
 
             print(f"  🤖 Agent step {step+1}: {tool_name}({tool_params})")
@@ -342,11 +359,8 @@ def agent_stream_ollama(model_name, chat_history, user_message, system_prompt=""
                     open_result = execute_tool("open_url", {"url": url})
                     tool_history.append(f"open_url({url})")
                     yield f"📋 Resultado: {open_result}\n"
-                    # Update feedback so LLM just needs to confirm
-                    feedback += (
-                        f"\n[RESULTADO 'open_url']:\n{open_result}\n\n"
-                        f"Ya abriste el video. Responde brevemente confirmando que lo abriste.\n"
-                    )
+                    # Done — don't let the LLM talk over the video
+                    return
 
             history_str = ", ".join(tool_history)
             feedback += (
