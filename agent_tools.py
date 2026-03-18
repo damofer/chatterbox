@@ -519,9 +519,40 @@ def tool_find_application(params: dict) -> str:
 
 def tool_open_application(params: dict) -> str:
     """Find and open an application by name. Scans the system automatically."""
+    import webbrowser
     query = params.get("name", "").strip()
     if not query:
-        return "Error: no se proporcionó nombre de aplicación."
+        return "Error: no se proporcion\u00f3 nombre de aplicaci\u00f3n."
+
+    # Known web apps/services — open in browser if no desktop app found
+    _WEB_APPS = {
+        "youtube": "https://www.youtube.com",
+        "gmail": "https://mail.google.com",
+        "google maps": "https://maps.google.com",
+        "maps": "https://maps.google.com",
+        "google drive": "https://drive.google.com",
+        "drive": "https://drive.google.com",
+        "netflix": "https://www.netflix.com",
+        "twitter": "https://twitter.com",
+        "x": "https://x.com",
+        "facebook": "https://www.facebook.com",
+        "instagram": "https://www.instagram.com",
+        "linkedin": "https://www.linkedin.com",
+        "reddit": "https://www.reddit.com",
+        "twitch": "https://www.twitch.tv",
+        "github": "https://github.com",
+        "chatgpt": "https://chat.openai.com",
+        "whatsapp web": "https://web.whatsapp.com",
+        "google": "https://www.google.com",
+        "amazon": "https://www.amazon.com",
+        "tiktok": "https://www.tiktok.com",
+        "pinterest": "https://www.pinterest.com",
+        "canva": "https://www.canva.com",
+        "notion": "https://www.notion.so",
+        "figma": "https://www.figma.com",
+        "trello": "https://trello.com",
+        "slack": "https://app.slack.com",
+    }
 
     # Search in order: Desktop → Start Menu → Registry → PATH
     launch_target = None
@@ -567,6 +598,15 @@ def tool_open_application(params: dict) -> str:
             pass
 
     if not launch_target:
+        # Check if it's a known web app/service
+        query_lower = query.lower()
+        for web_name, web_url in _WEB_APPS.items():
+            if query_lower in web_name or web_name in query_lower:
+                try:
+                    webbrowser.open(web_url)
+                    return f"Abriendo {web_name} en el navegador: {web_url}"
+                except Exception as e:
+                    return f"Error abriendo {web_url}: {e}"
         return f"No se encontró '{query}' instalado en el sistema."
 
     # Launch it
@@ -578,6 +618,67 @@ def tool_open_application(params: dict) -> str:
         return f"Abriendo {source} ({launch_target})"
     except Exception as e:
         return f"Error al abrir {launch_target}: {e}"
+
+
+def tool_open_url(params: dict) -> str:
+    """Open a URL in the default browser."""
+    import webbrowser
+    url = params.get("url", "").strip()
+    if not url:
+        return "Error: no se proporcionó URL."
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return "Error: solo se permiten URLs http/https."
+    try:
+        webbrowser.open(url)
+        return f"Abriendo en navegador: {url}"
+    except Exception as e:
+        return f"Error abriendo URL: {e}"
+
+
+def tool_youtube_search(params: dict) -> str:
+    """Search YouTube and return the first video results with titles and URLs."""
+    query = params.get("query", "").strip()
+    if not query:
+        return "Error: no se proporcionó búsqueda."
+    search_url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(query)
+    try:
+        req = urllib.request.Request(search_url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+
+        # Try to extract from ytInitialData JSON (includes titles)
+        m = re.search(r'var ytInitialData\s*=\s*(\{.+?\});\s*</script>', html, re.DOTALL)
+        if m:
+            import json as _json
+            data = _json.loads(m.group(1))
+            contents = data["contents"]["twoColumnSearchResultsRenderer"]["primaryContents"]["sectionListRenderer"]["contents"]
+            items = contents[0]["itemSectionRenderer"]["contents"]
+            results = []
+            for item in items:
+                v = item.get("videoRenderer", {})
+                if v.get("videoId"):
+                    title = v.get("title", {}).get("runs", [{}])[0].get("text", "Sin titulo")
+                    vid_url = f"https://www.youtube.com/watch?v={v['videoId']}"
+                    results.append(f"{len(results)+1}. {title}\n   {vid_url}")
+                    if len(results) >= 5:
+                        break
+            if results:
+                return "\n".join(results)
+
+        # Fallback: extract video IDs via regex
+        ids = re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', html)
+        unique = list(dict.fromkeys(ids))[:5]
+        if unique:
+            results = [f"{i+1}. https://www.youtube.com/watch?v={vid}" for i, vid in enumerate(unique)]
+            return "\n".join(results)
+
+        return "No se encontraron resultados."
+    except Exception as e:
+        return f"Error buscando en YouTube: {e}"
 
 
 # ─── Last tool result buffer (for save_last_result) ─────────────────────────
@@ -731,6 +832,25 @@ TOOLS = [
             "name": {"type": "string", "description": "Nombre de la aplicación a abrir (ej: 'steam', 'chrome', 'discord')", "required": True},
         },
         "function": tool_open_application,
+    },
+    {
+        "name": "open_url",
+        "description": "Abre una URL en el navegador predeterminado del usuario.",
+        "parameters": {
+            "url": {"type": "string", "description": "URL a abrir (http/https)", "required": True},
+        },
+        "function": tool_open_url,
+    },
+    {
+        "name": "youtube_search",
+        "description": (
+            "Busca videos en YouTube y devuelve los primeros 5 resultados con titulo y URL. "
+            "Usalo cuando el usuario pida buscar algo en YouTube o reproducir un video."
+        ),
+        "parameters": {
+            "query": {"type": "string", "description": "Texto a buscar en YouTube", "required": True},
+        },
+        "function": tool_youtube_search,
     },
     {
         "name": "save_last_result",

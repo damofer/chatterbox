@@ -32,6 +32,7 @@ NUNCA escribas "Ejecutando: herramienta(...)" como texto — eso no funciona.
 
 REGLAS FUNDAMENTALES:
 - NUNCA inventes datos. Si no has usado una herramienta para obtener un dato, NO lo sabes.
+- NUNCA inventes URLs. Si no obtuviste una URL de una herramienta, NO la conoces.
 - NUNCA preguntes "¿quieres que lo haga?" — simplemente hazlo.
 - NUNCA hagas acciones que el usuario NO pidió.
 - Responde en el idioma que usa el usuario.
@@ -95,19 +96,38 @@ CTX_APPS = """
 CONTEXTO: APLICACIONES
 
 Herramientas disponibles para esta tarea:
-- open_application: Busca y abre una aplicación por nombre. Escanea Escritorio, Menú Inicio, Registro, PATH.
-- find_application: Busca una aplicación sin abrirla, para verificar si está instalada.
+- open_application: Busca y abre una aplicacion por nombre.
+- find_application: Busca una aplicacion sin abrirla.
+- youtube_search: Busca videos en YouTube y devuelve los primeros resultados con titulo y URL.
+- open_url: Abre cualquier URL en el navegador.
 
 REGLAS:
-1. Si el usuario dice "abre Chrome/Steam/WhatsApp" → usa open_application directamente.
-2. Si pregunta "¿tengo instalado X?" → usa find_application.
-3. NUNCA uses run_command con "start" ni abras explorer.exe para abrir apps. Usa open_application.
-4. NUNCA adivines rutas de ejecutables.
+1. Si el usuario dice "abre Chrome/Steam/WhatsApp" -> usa open_application.
+2. Si pregunta "tengo instalado X?" -> usa find_application.
+3. NUNCA uses run_command con "start". Usa open_application.
+4. Si el usuario menciona YouTube + buscar/poner/reproducir algo:
+   - PRIMERO usa youtube_search. SIEMPRE. Sin excepciones.
+   - LUEGO usa open_url con la URL que devolvio youtube_search.
+   - NUNCA inventes URLs de YouTube. NUNCA uses open_url sin hacer youtube_search antes.
+   - NO uses open_application para esto. open_url con el resultado de youtube_search es suficiente.
+5. Si SOLO dice "abre YouTube" (sin buscar nada) -> usa open_application.
+6. NUNCA uses open_url con una URL que inventaste. Solo con URLs que obtuviste de youtube_search u otra herramienta.
 
-EJEMPLO:
+EJEMPLO - abrir app:
 ```tool_call
-{"tool": "open_application", "params": {"name": "whatsapp"}}
+{"tool": "open_application", "params": {"name": "steam"}}
 ```
+
+EJEMPLO - "abre YouTube, busca X y pon el primer enlace":
+Paso 1: ```tool_call
+{"tool": "youtube_search", "params": {"query": "shakira"}}
+```
+Resultado: "1. Shakira - Waka Waka\n   https://www.youtube.com/watch?v=abc123"
+
+Paso 2: ```tool_call
+{"tool": "open_url", "params": {"url": "https://www.youtube.com/watch?v=abc123"}}
+```
+Paso 3: Responde "Abri el video: Shakira - Waka Waka".
 """
 
 CTX_SYSTEM = """
@@ -186,7 +206,8 @@ _INTENT_PATTERNS = [
     # Applications
     (r"\b(abr[ei]|abrir|abre|ejecut[ae]|ejecutar|lanz[ae]|lanzar|inicia|iniciar|"
      r"cerr?ar|cierra|programa|aplicacion|app|chrome|firefox|steam|discord|"
-     r"whatsapp|telegram|spotify|word|excel|visual studio|vscode)\b", "apps"),
+     r"whatsapp|telegram|spotify|word|excel|visual studio|vscode|"
+     r"youtube|busca.*video|pon.*video|reproduce|reproducir|primer enlace|primer resultado)\b", "apps"),
     # System / utilities
     (r"\b(hora|fecha|tiempo|dia|que hora|que dia|calcul[ae]|cuanto es|matematica|"
      r"comando|terminal|consola|instala|pip|npm|web|url|pagina|api|"

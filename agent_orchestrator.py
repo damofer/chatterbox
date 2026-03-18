@@ -327,6 +327,27 @@ def agent_stream_ollama(model_name, chat_history, user_message, system_prompt=""
                 feedback += (
                     "(Resultado largo. Para guardarlo en archivo usa save_last_result.)\n\n"
                 )
+
+            # Auto-execute open_url after youtube_search if user wanted to play/open
+            if tool_name == "youtube_search" and not result.startswith("Error"):
+                import re as _re
+                wants_open = _re.search(
+                    r'\b(pon|abre|reproduce|reproducir|primer enlace|primer resultado|primer video|ponlo|abrelo)\b',
+                    user_message, _re.IGNORECASE
+                )
+                first_url_m = _re.search(r'(https://www\.youtube\.com/watch\?v=[a-zA-Z0-9_-]+)', result)
+                if wants_open and first_url_m:
+                    url = first_url_m.group(1)
+                    yield f"\n🔧 Ejecutando: open_url({{\"url\": \"{url}\"}})\n"
+                    open_result = execute_tool("open_url", {"url": url})
+                    tool_history.append(f"open_url({url})")
+                    yield f"📋 Resultado: {open_result}\n"
+                    # Update feedback so LLM just needs to confirm
+                    feedback += (
+                        f"\n[RESULTADO 'open_url']:\n{open_result}\n\n"
+                        f"Ya abriste el video. Responde brevemente confirmando que lo abriste.\n"
+                    )
+
             history_str = ", ".join(tool_history)
             feedback += (
                 f"Pasos completados: {history_str}\n"
