@@ -1446,7 +1446,30 @@ def toggle_backend(choice):
 
 # --- Gradio UI ---
 print("Construyendo interfaz Gradio...")
-with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
+_MOBILE_CSS = """
+/* ── Mobile-friendly overrides ── */
+@media (max-width: 768px) {
+    .gradio-container { padding: 4px !important; }
+    .contain { padding: 0 !important; }
+    /* Stack rows vertically on mobile */
+    .gr-group .gr-block.gr-box, .row { flex-wrap: wrap; }
+    /* Bigger touch targets */
+    button, .gr-button { min-height: 44px !important; font-size: 16px !important; }
+    input, textarea, select, .gr-input { font-size: 16px !important; }
+    /* Chatbot fills viewport height minus controls */
+    .chatbot { height: 55vh !important; max-height: 55vh !important; }
+    /* Audio controls wider */
+    .audio-container { width: 100% !important; }
+    /* Text input full width */
+    .textbox { min-width: 0 !important; }
+    /* Tab labels readable */
+    .tab-nav button { font-size: 15px !important; padding: 10px 8px !important; }
+}
+/* General improvements */
+.chatbot .message { word-break: break-word; }
+"""
+
+with gr.Blocks(title="Laris — Asistente de Voz IA", css=_MOBILE_CSS) as demo:
    
 
     # Conversation state (VAD buffer, flags, etc.)
@@ -1455,34 +1478,28 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
     with gr.Tabs():
         # ── Tab 1: Chat ──────────────────────────────────────
         with gr.Tab("💬 Chat"):
-            chatbot = gr.Chatbot(label="Conversación", height=450, type="messages")
+            chatbot = gr.Chatbot(label="Conversación", height="55vh", type="messages")
             audio_output = gr.Audio(
                 label="Respuesta de voz",
                 streaming=True,
                 autoplay=True,
             )
 
-            gr.Markdown("### 🎙️ Modo Conversación (grabar y procesar)")
-            gr.Markdown(
-                "Pulsa para grabar, vuelve a pulsar para parar. "
-                "Se procesa automáticamente al terminar la grabación."
-            )
             conversation_mic = gr.Audio(
                 sources=["microphone"],
                 type="filepath",
-                label="Grabar mensaje",
+                label="🎙️ Pulsa para grabar",
             )
 
             gr.Markdown("---")
-            gr.Markdown("### ✏️ Modo Manual (escribir)")
             with gr.Row():
                 user_input = gr.Textbox(
                     placeholder="Escribe algo...",
                     scale=4,
                     show_label=False,
                 )
-                send_btn = gr.Button("Enviar", variant="primary", scale=1)
-            clear_btn = gr.Button("Limpiar conversación")
+                send_btn = gr.Button("Enviar", variant="primary", scale=1, min_width=80)
+            clear_btn = gr.Button("Limpiar conversación", size="sm")
 
         # ── Tab 2: Configuración ─────────────────────────────
         with gr.Tab("⚙️ Configuración"):

@@ -100,6 +100,7 @@ Herramientas disponibles para esta tarea:
 - find_application: Busca una aplicacion sin abrirla.
 - youtube_search: Busca videos en YouTube y devuelve los primeros resultados con titulo y URL.
 - open_url: Abre cualquier URL en el navegador.
+- youtube_control: Controla el video de YouTube abierto (pause/resume/stop).
 
 REGLAS:
 1. Si el usuario dice "abre Chrome/Steam/WhatsApp" -> usa open_application.
@@ -114,6 +115,15 @@ REGLAS:
    - NO uses open_application para reproducir videos. Usa youtube_search + open_url.
 5. Si SOLO dice "abre YouTube" (sin buscar nada) -> usa open_application.
 6. Despues de abrir un video, responde SOLO con el titulo del video. No expliques lo que hiciste.
+7. Control de video:
+   - "pausa/para/detente/silencio" -> youtube_control con action="pause"
+   - "reanuda/sigue/continua/dale play" -> youtube_control con action="resume"
+   - "quita/cierra/detiene el video" -> youtube_control con action="stop"
+
+EJEMPLO — "pausa el video":
+```tool_call
+{"tool": "youtube_control", "params": {"action": "pause"}}
+```
 
 EJEMPLO CORRECTO — "pon shakira en youtube":
 Paso 1: ```tool_call
@@ -207,7 +217,9 @@ _INTENT_PATTERNS = [
     (r"\b(abr[ei]|abrir|abre|ejecut[ae]|ejecutar|lanz[ae]|lanzar|inicia|iniciar|"
      r"cerr?ar|cierra|programa|aplicacion|app|chrome|firefox|steam|discord|"
      r"whatsapp|telegram|spotify|word|excel|visual studio|vscode|"
-     r"youtube|busca.*video|pon.*video|reproduce|reproducir|primer enlace|primer resultado)\b", "apps"),
+     r"youtube|busca.*video|pon.*video|reproduce|reproducir|primer enlace|primer resultado|"
+     r"paus[ae]|reanud[ae]|deten(er|te|lo)?|par[ae].*video|quit[ae].*video|"
+     r"para el video|para la musica|silencia)\b", "apps"),
     # System / utilities
     (r"\b(hora|fecha|tiempo|dia|que hora|que dia|calcul[ae]|cuanto es|matematica|"
      r"comando|terminal|consola|instala|pip|npm|web|url|pagina|api|"

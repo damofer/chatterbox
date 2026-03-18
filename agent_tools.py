@@ -635,6 +635,61 @@ _yt_browser_proc: subprocess.Popen | None = None
 # Dedicated temp profile so Chrome spawns an independent, trackable process
 _YT_PROFILE_DIR = os.path.join(os.environ.get("TEMP", os.path.expanduser("~")), "laris_yt_player")
 
+# -- Win32 helpers for YouTube window control ---------------------------------
+import ctypes
+import ctypes.wintypes as _wt
+
+_user32 = ctypes.windll.user32
+
+
+def _find_youtube_windows() -> list[int]:
+    """Return HWNDs of visible windows whose title contains 'YouTube'."""
+    results: list[int] = []
+
+    @ctypes.WINFUNCTYPE(_wt.BOOL, _wt.HWND, _wt.LPARAM)
+    def _cb(hwnd, _lp):
+        if _user32.IsWindowVisible(hwnd):
+            length = _user32.GetWindowTextLengthW(hwnd)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                _user32.GetWindowTextW(hwnd, buf, length + 1)
+                if "youtube" in buf.value.lower():
+                    results.append(hwnd)
+        return True
+
+    _user32.EnumWindows(_cb, 0)
+    return results
+
+
+def _send_youtube_key(vk: int) -> bool:
+    """Bring the first YouTube window to the foreground and simulate a key press."""
+    import time as _t
+    hwnds = _find_youtube_windows()
+    if not hwnds:
+        print("  YT Control: No se encontro ventana de YouTube")
+        return False
+    hwnd = hwnds[0]
+    _user32.ShowWindow(hwnd, 9)        # SW_RESTORE (un-minimise)
+    _t.sleep(0.1)
+    _user32.SetForegroundWindow(hwnd)
+    _t.sleep(0.15)
+    _user32.keybd_event(vk, 0, 0, 0)              # key down
+    _t.sleep(0.05)
+    _user32.keybd_event(vk, 0, 0x0002, 0)         # key up  (KEYEVENTF_KEYUP)
+    print(f"  YT Control: Tecla VK=0x{vk:02X} enviada a hwnd={hwnd}")
+    return True
+
+
+def _close_youtube_windows() -> bool:
+    """Close all YouTube windows via WM_CLOSE."""
+    hwnds = _find_youtube_windows()
+    if not hwnds:
+        return False
+    for hwnd in hwnds:
+        _user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+    print(f"  YT Control: WM_CLOSE enviado a {len(hwnds)} ventana(s)")
+    return True
+
 
 def _find_browser_exe() -> str | None:
     """Find Chrome or Edge executable on Windows."""
@@ -652,27 +707,26 @@ def _find_browser_exe() -> str | None:
 
 
 def _close_yt_player():
-    """Terminate ALL Chrome/Edge processes using the laris_yt_player profile."""
+    """Close YouTube windows and clean up processes/profile locks."""
     global _yt_browser_proc
+    import time
 
-    # 1) Kill by tracked PID (process tree)
+    # 1) Close via window title (most reliable)
+    _close_youtube_windows()
+    time.sleep(0.5)
+
+    # 2) Kill tracked PID as fallback
     if _yt_browser_proc is not None:
-        pid = _yt_browser_proc.pid
         try:
             subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                ["taskkill", "/F", "/T", "/PID", str(_yt_browser_proc.pid)],
                 capture_output=True, timeout=5,
             )
         except Exception:
             pass
-        try:
-            _yt_browser_proc.wait(timeout=2)
-        except Exception:
-            pass
         _yt_browser_proc = None
 
-    # 2) Kill ANY remaining processes with our profile in their command line
-    #    (handles cases where Chrome delegated to another process)
+    # 3) Kill any remaining processes with our profile in their command line
     try:
         subprocess.run(
             'wmic process where "CommandLine like \'%laris_yt_player%\'" delete',
@@ -681,9 +735,7 @@ def _close_yt_player():
     except Exception:
         pass
 
-    # 3) Small wait for processes to fully exit
-    import time
-    time.sleep(0.5)
+    time.sleep(0.3)
 
     # 4) Remove profile lock files so the next instance starts cleanly
     for lock_name in ("lockfile", "SingletonLock", "SingletonSocket", "SingletonCookie"):
@@ -728,12 +780,35 @@ def _open_youtube(url: str) -> str:
         return f"Abriendo en navegador: {url}"
 
 
+def tool_youtube_control(params: dict) -> str:
+    """Control YouTube playback: pause, resume, or stop."""
+    action = params.get("action", "").strip().lower()
+    if action not in ("pause", "resume", "stop"):
+        return "Error: accion debe ser 'pause', 'resume' o 'stop'."
+
+    if action == "stop":
+        closed = _close_youtube_windows()
+        if not closed:
+            # Fallback to PID / wmic
+            if _yt_browser_proc is None:
+                return "No hay ningun video de YouTube abierto."
+            _close_yt_player()
+        return "Video de YouTube detenido y ventana cerrada."
+
+    # pause / resume  →  send 'K' key (YouTube toggle play/pause shortcut)
+    VK_K = 0x4B
+    if _send_youtube_key(VK_K):
+        return "Video pausado." if action == "pause" else "Video reanudado."
+
+    return "No se encontro la ventana de YouTube."
+
+
 def tool_open_url(params: dict) -> str:
     """Open a URL in the default browser. Auto-corrects fabricated YouTube URLs."""
     import webbrowser
     url = params.get("url", "").strip()
     if not url:
-        return "Error: no se proporcionó URL."
+        return "Error: no se proporcion\u00f3 URL."
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return "Error: solo se permiten URLs http/https."
@@ -997,6 +1072,22 @@ TOOLS = [
             "query": {"type": "string", "description": "Texto a buscar en YouTube", "required": True},
         },
         "function": tool_youtube_search,
+    },
+    {
+        "name": "youtube_control",
+        "description": (
+            "Controla la reproduccion del video de YouTube abierto. "
+            "Acciones: 'pause' (pausar), 'resume' (reanudar), 'stop' (detener y cerrar ventana). "
+            "Usalo cuando el usuario pida pausar, parar, detener, reanudar o quitar el video."
+        ),
+        "parameters": {
+            "action": {
+                "type": "string",
+                "description": "Accion: 'pause', 'resume' o 'stop'",
+                "required": True,
+            },
+        },
+        "function": tool_youtube_control,
     },
     {
         "name": "save_last_result",
