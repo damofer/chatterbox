@@ -48,8 +48,10 @@ $pthFile = Get-ChildItem $pythonDir -Filter "python*._pth"
 if ($pthFile) {
     $content = Get-Content $pthFile.FullName
     $content = $content -replace '^#import site', 'import site'
+    # Add ../app so embedded Python can find app modules (agent_*, voice_chat_app, etc.)
+    $content += '../app'
     $content | Set-Content $pthFile.FullName
-    Write-Host "  Habilitando pip (import site)..." -ForegroundColor Green
+    Write-Host "  Habilitando pip + ruta app (import site, ../app)..." -ForegroundColor Green
 }
 
 # Descargar get-pip.py
@@ -70,7 +72,7 @@ $appDir = Join-Path $buildDir "app"
 New-Item -ItemType Directory -Path $appDir | Out-Null
 
 # Archivos principales
-$files = @("voice_chat_app.py", "pyproject.toml", "README.md", "LICENSE", "laris_logo.png")
+$files = @("voice_chat_app.py", "agent_tools.py", "agent_orchestrator.py", "agent_contexts.py", "pyproject.toml", "README.md", "LICENSE", "laris_logo.png")
 foreach ($f in $files) {
     $src = Join-Path $projectDir $f
     if (Test-Path $src) {

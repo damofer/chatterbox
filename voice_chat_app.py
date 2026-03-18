@@ -11,6 +11,7 @@ Features:
   - Gemini (cloud) and Ollama (local, free) backends
 """
 
+import sys
 import json
 import logging
 import os
@@ -21,6 +22,19 @@ import tempfile
 import threading
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+
+# Force unbuffered output so progress messages show immediately in .bat windows
+if not getattr(sys.stdout, "_laris_wrapped", False):
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
+    sys.stdout._laris_wrapped = True
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", line_buffering=True)
+    sys.stderr._laris_wrapped = True
+
+print("=" * 50)
+print("  Laris — Iniciando...")
+print("=" * 50)
+print()
 
 # Suppress benign uvicorn RuntimeError when Gradio cancels streaming responses
 class _UvicornCancelFilter(logging.Filter):
@@ -33,6 +47,13 @@ class _UvicornCancelFilter(logging.Filter):
 
 logging.getLogger("uvicorn.error").addFilter(_UvicornCancelFilter())
 logging.getLogger("uvicorn").addFilter(_UvicornCancelFilter())
+
+# Suppress harmless Windows asyncio ConnectionResetError noise
+logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+
+# Suppress pkg_resources deprecation warning from older packages
+import warnings
+warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*")
 
 # Ensure ffmpeg is discoverable (PATH may not be refreshed in spawned terminals)
 if os.name == "nt" and not shutil.which("ffmpeg"):
@@ -47,25 +68,46 @@ if os.name == "nt" and not shutil.which("ffmpeg"):
         except OSError:
             pass
 
+# Fallback: if ffmpeg still not found, use imageio-ffmpeg bundled binary
+if not shutil.which("ffmpeg"):
+    try:
+        import imageio_ffmpeg
+        _ffmpeg_dir = os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe())
+        os.environ["PATH"] += os.pathsep + _ffmpeg_dir
+    except Exception:
+        pass
+
+print("[1/6] Cargando PyTorch...")
 import torch
 import numpy as np
 import soundfile as sf
+
+print("[2/6] Cargando Gradio...")
 import gradio as gr
+
+print("[3/6] Cargando backends LLM...")
 from google import genai
 from google.genai import errors as genai_errors
 import ollama
+
+print("[4/6] Cargando Chatterbox TTS...")
 from chatterbox.tts import ChatterboxTTS
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
 from agent_orchestrator import agent_stream_gemini, agent_stream_ollama
 
 # RAG dependencies
+print("[5/6] Cargando dependencias RAG...")
 import glob
 import fitz  # PyMuPDF
 import chromadb
 from sentence_transformers import SentenceTransformer
 
+print("[6/6] Inicializando...")
+print()
+
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"  Dispositivo: {DEVICE}")
 
 # --- CUDA performance optimizations ---
 if DEVICE == "cuda":
@@ -582,6 +624,15 @@ def stream_ollama(model_name, chat_history, user_message, custom_prompt=""):
 
 def get_ollama_models():
     try:
+        # Quick check: if Ollama server isn't reachable, bail fast
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1)
+        try:
+            s.connect(("127.0.0.1", 11434))
+            s.close()
+        except (ConnectionRefusedError, OSError):
+            return []
         models = ollama.list()
         return [m.model for m in models.models] if models.models else []
     except Exception:
@@ -1394,6 +1445,7 @@ def toggle_backend(choice):
 
 
 # --- Gradio UI ---
+print("Construyendo interfaz Gradio...")
 with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
    
 
@@ -1790,6 +1842,52 @@ with gr.Blocks(title="Laris — Asistente de Voz IA") as demo:
 
 
 if __name__ == "__main__":
+    # Generate self-signed SSL cert if missing (needed for phone mic access over LAN)
+    _app_dir = os.path.dirname(os.path.abspath(__file__))
+    _cert_dir = os.path.join(_app_dir, "certs")
+    if not os.path.isfile(os.path.join(_cert_dir, "server.crt")):
+        print("Generando certificado SSL para acceso desde teléfono...")
+        try:
+            import datetime as _dt, ipaddress as _ipa
+            from cryptography import x509 as _x509
+            from cryptography.x509.oid import NameOID as _NameOID
+            from cryptography.hazmat.primitives import hashes as _hashes, serialization as _ser
+            from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+            os.makedirs(_cert_dir, exist_ok=True)
+            _key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            _subj = _x509.Name([_x509.NameAttribute(_NameOID.COMMON_NAME, "Laris")])
+            import socket as _sock
+            try:
+                _s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+                _s.connect(("8.8.8.8", 80))
+                _my_ip = _s.getsockname()[0]
+                _s.close()
+            except Exception:
+                _my_ip = "127.0.0.1"
+            _cert = (
+                _x509.CertificateBuilder()
+                .subject_name(_subj).issuer_name(_subj)
+                .public_key(_key.public_key())
+                .serial_number(_x509.random_serial_number())
+                .not_valid_before(_dt.datetime.utcnow())
+                .not_valid_after(_dt.datetime.utcnow() + _dt.timedelta(days=3650))
+                .add_extension(_x509.SubjectAlternativeName([
+                    _x509.DNSName("localhost"),
+                    _x509.IPAddress(_ipa.IPv4Address(_my_ip)),
+                ]), critical=False)
+                .sign(_key, _hashes.SHA256())
+            )
+            with open(os.path.join(_cert_dir, "server.key"), "wb") as _f:
+                _f.write(_key.private_bytes(_ser.Encoding.PEM, _ser.PrivateFormat.TraditionalOpenSSL, _ser.NoEncryption()))
+            with open(os.path.join(_cert_dir, "server.crt"), "wb") as _f:
+                _f.write(_cert.public_bytes(_ser.Encoding.PEM))
+            print("  Certificado SSL creado.")
+        except Exception as _e:
+            print(f"  ⚠️ No se pudo crear certificado SSL: {_e}")
+            print("  El micrófono puede no funcionar desde el teléfono.")
+
+    print()
+    print("Descargando/cargando modelo TTS (primera vez puede tardar varios minutos)...")
     load_tts("multilingual")  # Pre-load multilingual model at startup
     # Auto-index knowledge base if documents exist
     _kb_files = glob.glob(os.path.join(_KNOWLEDGE_DIR, "**/*.pdf"), recursive=True) + \
@@ -1798,4 +1896,37 @@ if __name__ == "__main__":
     if _kb_files:
         print(f"Indexando {len(_kb_files)} documentos de knowledge/...")
         index_knowledge_base()
-    demo.queue(max_size=20, default_concurrency_limit=1).launch(share=True, favicon_path="laris_logo.png")
+    print()
+    # Detect LAN IP for phone access
+    import socket as _sock
+    try:
+        _s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+        _s.connect(("8.8.8.8", 80))
+        _lan_ip = _s.getsockname()[0]
+        _s.close()
+    except Exception:
+        _lan_ip = "192.168.1.27"
+
+    # SSL cert for HTTPS (required for microphone access from phone)
+    _app_dir = os.path.dirname(os.path.abspath(__file__))
+    _cert_file = os.path.join(_app_dir, "certs", "server.crt")
+    _key_file = os.path.join(_app_dir, "certs", "server.key")
+    _use_ssl = os.path.isfile(_cert_file) and os.path.isfile(_key_file)
+    _ssl_args = {}
+    if _use_ssl:
+        _ssl_args = {"ssl_certfile": _cert_file, "ssl_keyfile": _key_file, "ssl_verify": False}
+        _proto = "https"
+    else:
+        _proto = "http"
+
+    print("Iniciando servidor Gradio...")
+    print()
+    print(f"   PC:        {_proto}://localhost:7860")
+    print(f"   Teléfono:  {_proto}://{_lan_ip}:7860  (misma red WiFi)")
+    if _use_ssl:
+        print(f"   (HTTPS habilitado — acepta el certificado en el teléfono)")
+    print()
+    demo.queue(max_size=20, default_concurrency_limit=1).launch(
+        share=False, server_name="0.0.0.0", favicon_path="laris_logo.png", inbrowser=True,
+        **_ssl_args,
+    )

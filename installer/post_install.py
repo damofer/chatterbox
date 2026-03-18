@@ -63,12 +63,64 @@ def main():
     # Dependencias de la app de voz
     run("Instalando dependencias de voz (Whisper, Ollama, Gemini)",
         pip_exe + ["install",
-                   "google-genai", "ollama", "openai-whisper"])
+                   "google-genai", "ollama", "openai-whisper",
+                   "transformers", "accelerate",
+                   "imageio-ffmpeg"])
 
     # RAG
     run("Instalando dependencias RAG",
         pip_exe + ["install",
                    "chromadb", "sentence-transformers", "PyMuPDF"])
+
+    # Re-pin setuptools (some deps may have upgraded it past 81)
+    run("Fijando setuptools compatible",
+        pip_exe + ["install", "setuptools<81"])
+
+    # --- Install Ollama (local LLM backend) ---
+    install_ollama = os.environ.get("LARIS_INSTALL_OLLAMA", "0") == "1"
+    if install_ollama:
+        import shutil
+        import urllib.request
+        if not shutil.which("ollama"):
+            ollama_installer = os.path.join(os.environ.get("TEMP", "."), "OllamaSetup.exe")
+            print()
+            print("[*] Descargando Ollama (backend LLM local)...")
+            try:
+                urllib.request.urlretrieve(
+                    "https://ollama.com/download/OllamaSetup.exe",
+                    ollama_installer,
+                )
+                print("[*] Instalando Ollama (silencioso)...")
+                result = subprocess.run([ollama_installer, "/VERYSILENT", "/NORESTART"])
+                if result.returncode == 0:
+                    print("    ✅ Ollama instalado correctamente")
+                else:
+                    print(f"    ⚠️ Ollama instalador retornó código {result.returncode}")
+            except Exception as e:
+                print(f"    ⚠️ No se pudo instalar Ollama: {e}")
+                print("    Puedes instalarlo manualmente desde https://ollama.com")
+            finally:
+                try:
+                    os.remove(ollama_installer)
+                except OSError:
+                    pass
+        else:
+            print("[*] Ollama ya está instalado ✅")
+
+        # Pull default model
+        import shutil as _sh
+        ollama_exe = _sh.which("ollama")
+        if ollama_exe:
+            print("[*] Descargando modelo Ollama por defecto (llama3.2, ~2 GB)...")
+            print("    Esto puede tardar varios minutos...")
+            result = subprocess.run([ollama_exe, "pull", "llama3.2"])
+            if result.returncode == 0:
+                print("    ✅ Modelo llama3.2 descargado")
+            else:
+                print("    ⚠️ No se pudo descargar el modelo. Puedes hacerlo después con: ollama pull llama3.2")
+    else:
+        print()
+        print("[*] Ollama omitido (no seleccionado). Puedes instalarlo después desde https://ollama.com")
 
     print()
     print("=" * 50)

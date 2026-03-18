@@ -43,6 +43,7 @@ spanish.WelcomeLabel2=Este asistente instalará [name/ver] en tu computadora.%n%
 [Tasks]
 Name: "desktopicon"; Description: "Crear acceso directo en el Escritorio"; GroupDescription: "Accesos directos:"
 Name: "ffmpeg"; Description: "Instalar ffmpeg (necesario para reconocimiento de voz)"; GroupDescription: "Componentes adicionales:"
+Name: "ollama"; Description: "Instalar Ollama + modelo llama3.2 (~2 GB, LLM local gratuito)"; GroupDescription: "Componentes adicionales:"; Flags: checkedonce
 
 [Files]
 ; Python embebido
@@ -89,4 +90,8 @@ procedure SetEnvVars();
 begin
   SetEnvironmentVariable('LARIS_APP_DIR', ExpandConstant('{app}\app'));
   SetEnvironmentVariable('LARIS_PYTHON_DIR', ExpandConstant('{app}\python'));
+  if IsTaskSelected('ollama') then
+    SetEnvironmentVariable('LARIS_INSTALL_OLLAMA', '1')
+  else
+    SetEnvironmentVariable('LARIS_INSTALL_OLLAMA', '0');
 end;

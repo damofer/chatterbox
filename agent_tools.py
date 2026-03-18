@@ -24,6 +24,13 @@ import urllib.error
 _WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
 _ALLOWED_ROOTS = [_WORKSPACE_DIR, os.path.expanduser("~")]
 
+# ─── User message context (set by orchestrator each turn) ────────────────────
+_last_user_message = ""
+
+def set_last_user_message(msg: str):
+    global _last_user_message
+    _last_user_message = msg
+
 # Blocked commands that could cause damage
 _BLOCKED_CMD_PATTERNS = [
     r"\brm\s+-rf\s+/",
@@ -620,8 +627,109 @@ def tool_open_application(params: dict) -> str:
         return f"Error al abrir {launch_target}: {e}"
 
 
+# Track real video IDs returned by youtube_search so open_url can validate
+_youtube_known_ids: set[str] = set()
+
+# Track YouTube browser process so we can close it before opening a new video
+_yt_browser_proc: subprocess.Popen | None = None
+# Dedicated temp profile so Chrome spawns an independent, trackable process
+_YT_PROFILE_DIR = os.path.join(os.environ.get("TEMP", os.path.expanduser("~")), "laris_yt_player")
+
+
+def _find_browser_exe() -> str | None:
+    """Find Chrome or Edge executable on Windows."""
+    candidates = [
+        os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return shutil.which("chrome") or shutil.which("msedge")
+
+
+def _close_yt_player():
+    """Terminate ALL Chrome/Edge processes using the laris_yt_player profile."""
+    global _yt_browser_proc
+
+    # 1) Kill by tracked PID (process tree)
+    if _yt_browser_proc is not None:
+        pid = _yt_browser_proc.pid
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+        try:
+            _yt_browser_proc.wait(timeout=2)
+        except Exception:
+            pass
+        _yt_browser_proc = None
+
+    # 2) Kill ANY remaining processes with our profile in their command line
+    #    (handles cases where Chrome delegated to another process)
+    try:
+        subprocess.run(
+            'wmic process where "CommandLine like \'%laris_yt_player%\'" delete',
+            capture_output=True, shell=True, timeout=5,
+        )
+    except Exception:
+        pass
+
+    # 3) Small wait for processes to fully exit
+    import time
+    time.sleep(0.5)
+
+    # 4) Remove profile lock files so the next instance starts cleanly
+    for lock_name in ("lockfile", "SingletonLock", "SingletonSocket", "SingletonCookie"):
+        lock_path = os.path.join(_YT_PROFILE_DIR, lock_name)
+        try:
+            os.remove(lock_path)
+        except OSError:
+            pass
+
+
+def _open_youtube(url: str) -> str:
+    """Open a YouTube URL in a dedicated browser window, closing any previous one."""
+    global _yt_browser_proc
+
+    # Ensure autoplay parameter is present
+    if "youtube.com/watch" in url and "autoplay=" not in url:
+        sep = "&" if "?" in url else "?"
+        url = url + sep + "autoplay=1"
+
+    # Close previous YouTube window
+    _close_yt_player()
+
+    browser = _find_browser_exe()
+    if browser:
+        # Use a dedicated profile so it's a separate window we can track/kill.
+        # Open as a regular window (NOT --app) to avoid Chrome delegating to
+        # an installed YouTube PWA which we can't control.
+        _yt_browser_proc = subprocess.Popen([
+            browser,
+            f"--user-data-dir={_YT_PROFILE_DIR}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--autoplay-policy=no-user-gesture-required",
+            "--new-window",
+            url,
+        ])
+        return f"Abriendo en navegador: {url}"
+    else:
+        # Fallback: regular browser open (can't track/close)
+        import webbrowser
+        webbrowser.open(url)
+        return f"Abriendo en navegador: {url}"
+
+
 def tool_open_url(params: dict) -> str:
-    """Open a URL in the default browser."""
+    """Open a URL in the default browser. Auto-corrects fabricated YouTube URLs."""
     import webbrowser
     url = params.get("url", "").strip()
     if not url:
@@ -629,6 +737,41 @@ def tool_open_url(params: dict) -> str:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return "Error: solo se permiten URLs http/https."
+
+    # Intercept fabricated YouTube URLs: if the LLM invented a video ID,
+    # extract the search intent and do a real youtube_search instead.
+    yt_match = re.match(
+        r"https?://(?:www\.)?youtube\.com/watch\?v=([a-zA-Z0-9_-]+)", url
+    )
+    if yt_match:
+        vid_id = yt_match.group(1)
+        if vid_id not in _youtube_known_ids:
+            # The LLM fabricated this URL — use the user's message as YouTube search query
+            query = _last_user_message
+            # Remove "laris" prefix and "youtube" references
+            query = re.sub(r"(?i)^laris[,:]?\s*", "", query)
+            query = re.sub(r"(?i)\byoutube\b", "", query)
+            query = re.sub(r"\s+", " ", query).strip(",.!? ")
+            if not query:
+                query = vid_id
+            print(f"  ⚠️ URL de YouTube inventada detectada ({vid_id}), buscando: '{query}'")
+            search_result = tool_youtube_search({"query": query})
+            # Extract first real URL from results
+            first_url_match = re.search(r"(https://www\.youtube\.com/watch\?v=[a-zA-Z0-9_-]{11})", search_result)
+            if first_url_match:
+                url = first_url_match.group(1)
+                print(f"  ✅ URL real encontrada: {url}")
+            else:
+                return f"No se encontraron videos reales. Resultado de búsqueda: {search_result}"
+
+    # YouTube URLs: use dedicated app-mode window (closeable)
+    is_youtube = re.match(r"https?://(?:www\.)?youtube\.com/", url)
+    if is_youtube:
+        try:
+            return _open_youtube(url)
+        except Exception as e:
+            return f"Error abriendo URL: {e}"
+
     try:
         webbrowser.open(url)
         return f"Abriendo en navegador: {url}"
@@ -661,6 +804,7 @@ def tool_youtube_search(params: dict) -> str:
             for item in items:
                 v = item.get("videoRenderer", {})
                 if v.get("videoId"):
+                    _youtube_known_ids.add(v['videoId'])
                     title = v.get("title", {}).get("runs", [{}])[0].get("text", "Sin titulo")
                     vid_url = f"https://www.youtube.com/watch?v={v['videoId']}"
                     results.append(f"{len(results)+1}. {title}\n   {vid_url}")
@@ -673,6 +817,8 @@ def tool_youtube_search(params: dict) -> str:
         ids = re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', html)
         unique = list(dict.fromkeys(ids))[:5]
         if unique:
+            for vid in unique:
+                _youtube_known_ids.add(vid)
             results = [f"{i+1}. https://www.youtube.com/watch?v={vid}" for i, vid in enumerate(unique)]
             return "\n".join(results)
 

@@ -105,29 +105,29 @@ REGLAS:
 1. Si el usuario dice "abre Chrome/Steam/WhatsApp" -> usa open_application.
 2. Si pregunta "tengo instalado X?" -> usa find_application.
 3. NUNCA uses run_command con "start". Usa open_application.
-4. Si el usuario menciona YouTube + buscar/poner/reproducir algo:
-   - PRIMERO usa youtube_search. SIEMPRE. Sin excepciones.
-   - LUEGO usa open_url con la URL que devolvio youtube_search.
-   - NUNCA inventes URLs de YouTube. NUNCA uses open_url sin hacer youtube_search antes.
-   - NO uses open_application para esto. open_url con el resultado de youtube_search es suficiente.
+4. YouTube — SIEMPRE sigue estos 2 pasos EN ORDEN:
+   Paso 1: Usa youtube_search con lo que el usuario quiere ver/escuchar.
+   Paso 2: Cuando recibas los resultados, usa open_url con la primera URL.
+   IMPORTANTE:
+   - SIEMPRE haz los 2 pasos. NUNCA te detengas despues del paso 1.
+   - NUNCA inventes URLs de YouTube. Solo usa URLs del resultado de youtube_search.
+   - NO uses open_application para reproducir videos. Usa youtube_search + open_url.
 5. Si SOLO dice "abre YouTube" (sin buscar nada) -> usa open_application.
-6. NUNCA uses open_url con una URL que inventaste. Solo con URLs que obtuviste de youtube_search u otra herramienta.
+6. Despues de abrir un video, responde SOLO con el titulo del video. No expliques lo que hiciste.
 
-EJEMPLO - abrir app:
-```tool_call
-{"tool": "open_application", "params": {"name": "steam"}}
-```
-
-EJEMPLO - "abre YouTube, busca X y pon el primer enlace":
+EJEMPLO CORRECTO — "pon shakira en youtube":
 Paso 1: ```tool_call
 {"tool": "youtube_search", "params": {"query": "shakira"}}
 ```
-Resultado: "1. Shakira - Waka Waka\n   https://www.youtube.com/watch?v=abc123"
-
+(Recibes resultado con URLs reales)
 Paso 2: ```tool_call
-{"tool": "open_url", "params": {"url": "https://www.youtube.com/watch?v=abc123"}}
+{"tool": "open_url", "params": {"url": "https://www.youtube.com/watch?v=URLREAL"}}
 ```
-Paso 3: Responde "Abri el video: Shakira - Waka Waka".
+
+EJEMPLO INCORRECTO — NUNCA hagas esto:
+```tool_call
+{"tool": "open_url", "params": {"url": "https://www.youtube.com/watch?v=inventado"}}
+```
 """
 
 CTX_SYSTEM = """
@@ -225,9 +225,19 @@ def detect_intents(user_message: str) -> set[str]:
         if pattern.search(normalized):
             intents.add(key)
     # If no specific intent detected, load all contexts as fallback
+    # Exclude "save" from fallback — only trigger save when explicitly requested
     if not intents:
-        intents = {"files", "apps", "system", "save"}
+        intents = {"files", "apps", "system"}
     return intents
+
+
+def has_explicit_intents(user_message: str) -> bool:
+    """Return True if any tool-related intent pattern explicitly matches the message."""
+    normalized = _normalize(user_message)
+    for pattern, key in _COMPILED_PATTERNS:
+        if key in ("files", "apps", "system", "save") and pattern.search(normalized):
+            return True
+    return False
 
 
 def build_context_prompt(user_message: str) -> str:

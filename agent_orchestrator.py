@@ -25,10 +25,48 @@ from agent_tools import (
     get_tools_json_schema,
     set_last_tool_result,
     set_last_response,
+    set_last_user_message,
 )
 from agent_contexts import build_context_prompt, detect_intents
 
 MAX_AGENT_STEPS = 50  # prevent infinite loops
+
+# 2-tier model config (loaded from config.json once)
+_ollama_models = {"light": "", "heavy": ""}
+try:
+    _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    with open(_cfg_path, "r", encoding="utf-8") as _f:
+        _cfg = json.load(_f)
+    _ollama_models["light"] = _cfg.get("ollama_model_light", "")
+    _ollama_models["heavy"] = _cfg.get("ollama_model", "")
+except Exception:
+    pass
+
+_TIER_ICONS = {"light": "[LIGHT]", "heavy": "[HEAVY]"}
+_TIER_LABELS = {"light": "chat simple", "heavy": "tarea compleja"}
+
+
+def _pick_model(tier: str, fallback_model: str) -> str:
+    """Return the model name for the given tier, falling back as needed."""
+    model = _ollama_models.get(tier, "")
+    if model:
+        return model
+    return _ollama_models.get("heavy") or fallback_model
+
+
+def _classify_tier(user_message: str, tool_history: list[str]) -> str:
+    """
+    Classify which model tier to use based on message intents and tool history.
+    Returns 'light' for simple chat, 'heavy' for anything needing tools.
+    """
+    from agent_contexts import _COMPILED_PATTERNS
+    normalized = user_message.lower()
+    for pattern, key in _COMPILED_PATTERNS:
+        if pattern.search(normalized):
+            return "heavy"
+    if tool_history:
+        return "heavy"
+    return "light"
 
 
 def _build_system_context() -> str:
@@ -107,6 +145,7 @@ def agent_stream_gemini(api_key, model_name, chat_history, user_message, system_
     client = genai.Client(api_key=api_key)
     context_prompt = build_context_prompt(user_message)
     full_system = system_prompt + "\n" + context_prompt + "\n" + _build_system_context()
+    set_last_user_message(user_message)
 
     # Build contents from history
     contents = []
@@ -160,6 +199,10 @@ def agent_stream_gemini(api_key, model_name, chat_history, user_message, system_
             print(f"  📋 Result: {result[:200]}...")
 
             yield f"📋 Resultado: {result[:150]}{'...' if len(result) > 150 else ''}\n"
+
+            # If we just opened a YouTube video, stop — don't let LLM talk over it
+            if tool_name == "open_url" and "youtube.com/watch" in result:
+                return
 
             # Add the function call and result to contents for next iteration
             contents.append({"role": "model", "parts": [part]})
@@ -278,6 +321,7 @@ def agent_stream_ollama(model_name, chat_history, user_message, system_prompt=""
     full_system = (system_prompt + "\n" + context_prompt + "\n" 
                    + _build_system_context() + "\n"
                    + _OLLAMA_TOOL_PROMPT.format(tools_description=tools_desc))
+    set_last_user_message(user_message)
 
     messages = [{"role": "system", "content": full_system}]
     for msg in chat_history:
@@ -287,13 +331,24 @@ def agent_stream_ollama(model_name, chat_history, user_message, system_prompt=""
     # Track tool calls so the LLM can see what's done vs pending
     tool_history = []
     intents = detect_intents(user_message)
+
+    # Initial model tier selection (will be re-evaluated each step)
+    current_tier = _classify_tier(user_message, tool_history)
+    active_model = _pick_model(current_tier, model_name)
+    print(f"  {_TIER_ICONS[current_tier]} Usando modelo {current_tier}: {active_model} ({_TIER_LABELS[current_tier]})")
     save_prompted = False
 
     for step in range(MAX_AGENT_STEPS):
+        # Re-evaluate tier each step (may escalate as tool_history grows)
+        new_tier = _classify_tier(user_message, tool_history)
+        if new_tier != current_tier:
+            current_tier = new_tier
+            active_model = _pick_model(current_tier, model_name)
+            print(f"  {_TIER_ICONS[current_tier]} Escalando a modelo {current_tier}: {active_model} ({_TIER_LABELS[current_tier]})")
         # Collect full response first (need to detect tool calls)
         full_response = ""
         try:
-            for chunk in ollama_client.chat(model=model_name, messages=messages, stream=True):
+            for chunk in ollama_client.chat(model=active_model, messages=messages, stream=True):
                 if chunk.message.content:
                     full_response += chunk.message.content
         except Exception as e:
@@ -305,22 +360,6 @@ def agent_stream_ollama(model_name, chat_history, user_message, system_prompt=""
 
         if tool_call:
             tool_name, tool_params = tool_call
-
-            # --- Auto-redirect: open_application("youtube") → youtube_search when user wants to search ---
-            import re as _re
-            if tool_name == "open_application" and tool_params.get("name", "").lower().strip() in ("youtube", "yt"):
-                yt_search_match = _re.search(
-                    r'\bbusca(?:r|me)?\s+(.+?)(?:\s+y\s+(?:abre|pon|reproduce|ponme|abrelo|ponlo|mete)\b|$)',
-                    user_message, _re.IGNORECASE
-                )
-                if not yt_search_match:
-                    # Try broader: anything after "busca" up to end
-                    yt_search_match = _re.search(r'\bbusca(?:r|me)?\s+(.+)', user_message, _re.IGNORECASE)
-                if yt_search_match:
-                    query = yt_search_match.group(1).strip().rstrip('.')
-                    print(f"  🔄 Redirect: open_application(youtube) → youtube_search({query})")
-                    tool_name = "youtube_search"
-                    tool_params = {"query": query}
 
             yield f"\n🔧 Ejecutando: {tool_name}({json.dumps(tool_params, ensure_ascii=False)[:100]})\n"
 
@@ -335,6 +374,10 @@ def agent_stream_ollama(model_name, chat_history, user_message, system_prompt=""
             param_summary = next(iter(tool_params.values()), "") if tool_params else ""
             tool_history.append(f"{tool_name}({param_summary})")
 
+            # If we just opened a YouTube video, stop — don't let LLM talk over it
+            if tool_name == "open_url" and "youtube.com/watch" in result:
+                return
+
             # Build feedback message with history so LLM knows what's done
             feedback = (
                 f"[RESULTADO '{tool_name}']:\n"
@@ -344,23 +387,6 @@ def agent_stream_ollama(model_name, chat_history, user_message, system_prompt=""
                 feedback += (
                     "(Resultado largo. Para guardarlo en archivo usa save_last_result.)\n\n"
                 )
-
-            # Auto-execute open_url after youtube_search if user wanted to play/open
-            if tool_name == "youtube_search" and not result.startswith("Error"):
-                import re as _re
-                wants_open = _re.search(
-                    r'\b(pon|abre|reproduce|reproducir|primer enlace|primer resultado|primer video|ponlo|abrelo)\b',
-                    user_message, _re.IGNORECASE
-                )
-                first_url_m = _re.search(r'(https://www\.youtube\.com/watch\?v=[a-zA-Z0-9_-]+)', result)
-                if wants_open and first_url_m:
-                    url = first_url_m.group(1)
-                    yield f"\n🔧 Ejecutando: open_url({{\"url\": \"{url}\"}})\n"
-                    open_result = execute_tool("open_url", {"url": url})
-                    tool_history.append(f"open_url({url})")
-                    yield f"📋 Resultado: {open_result}\n"
-                    # Done — don't let the LLM talk over the video
-                    return
 
             history_str = ", ".join(tool_history)
             feedback += (
